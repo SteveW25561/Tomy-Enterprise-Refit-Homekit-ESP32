@@ -6,31 +6,27 @@
  *
  * WIRING
  * ──────
- *   GPIO 4  →  220Ω  →  Pad A  (Mode Select)
- *   GPIO 5  →  220Ω  →  Pad B  (Fire Control)
- *   GND     →          Pad G  (shared ground)
+ *   GPIO 4  →  220Ω  →  [47-100pF cap]  →  Pad A  (Mode Select)
+ *   GPIO 5  →  220Ω  →  [47-100pF cap]  →  Pad B  (Fire Control)
+ *   GND     →                               Pad G  (shared ground)
  *
- * TOUCH SIMULATION PRINCIPLE
- * ──────────────────────────
- * Capacitive touch ICs detect increased capacitance to GND on their
- * electrode. Briefly pulling the electrode LOW through 220Ω mimics
- * the conductance path a finger provides.
+ *   The capacitor is required. Place it in series between the 220Ω
+ *   resistor and the touch pad. A 47pF or 100pF ceramic cap works well.
  *
- * Idle state  = INPUT (high-Z) — don't disturb the touch circuit
- * Touch pulse = OUTPUT LOW for ~80ms, then release back to INPUT
+ * TOUCH SIMULATION — capacitor charge injection
+ * ─────────────────────────────────────────────
+ * The board already has 1kΩ series resistors (R22/R10) before the
+ * touch IC, making direct LOW-pull insufficient. Charge injection used:
  *
- * If touches are not registering reliably:
- *   Add a 47-100 pF capacitor between the 220Ω and each touch pad.
- *   Then flip the logic:
- *     - Idle  = OUTPUT LOW (cap uncharged, no effect)
- *     - Touch = OUTPUT HIGH briefly (cap charges → injects charge
- *               into electrode, cleanly mimicking finger capacitance)
- *   Uncomment CAP_MODE below to switch to that approach.
+ *   Idle  = OUTPUT LOW  (cap uncharged — no effect on electrode)
+ *   Touch = OUTPUT HIGH briefly (cap charges → injects charge pulse
+ *           into electrode, mimicking finger capacitance)
+ *   Release = OUTPUT LOW again (cap discharges — touch ends)
  *
  * HOMEKIT ACCESSORIES (appear as two switches in the Home app)
  * ─────────────────────────────────────────────────────────────
- *   "USS Enterprise"    ON  → tap A once, wait 5 s, tap A 3 more times
- *                             (turns on → cycles through to Warp Speed)
+ *   "USS Enterprise"    ON  → tap A once, wait 5 s, tap A 4 more times
+ *                             (turns on → cycles to Warp Speed Mode)
  *                       OFF → hold A for 3.3 s (power-down sequence)
  *
  *   "Photon Torpedoes"  ON  → triple-tap B, 1 s apart (Battle Mode)
@@ -42,7 +38,7 @@
  *   2. Type  W <SSID> <password>  then press Enter
  *   3. Reboot; the ESP32 joins WiFi and announces itself
  *   4. Open iPhone Home app → Add Accessory → "More options"
- *      → choose "Enterprise Bridge" → enter code:  466-37-726
+ *      → choose "Enterprise Bridge" → enter code:  473-92-615
  *   5. Accept both accessories when prompted
  *
  * LIBRARY
@@ -58,44 +54,29 @@
 static constexpr int PIN_A = 4;   // Mode Select
 static constexpr int PIN_B = 5;   // Fire Control
 
-// ── Uncomment to use capacitor-injection mode ──────────────────────────────
-// #define CAP_MODE
-
 // ── Timing (ms) ───────────────────────────────────────────────────────────
-static constexpr int TOUCH_PULSE_MS    =   80;   // Duration of a single press
-static constexpr int TOUCH_SETTLE_MS   =   30;   // Settle time after release
+static constexpr int TOUCH_PULSE_MS    =  500;   // Long pulse to compensate for board series resistance   // Charge injection duration
+static constexpr int TOUCH_SETTLE_MS   =   50;   // Settle time after release
 static constexpr int PRESS_GAP_MS      = 1000;   // Gap between repeated presses
 static constexpr int POWER_OFF_HOLD_MS = 3300;   // Hold duration for OFF
 static constexpr int STARTUP_WAIT_MS   = 5000;   // Wait for startup animation
 
-// ── Touch simulation primitives ────────────────────────────────────────────
+// ── Touch simulation — capacitor charge injection ──────────────────────────
 
+// Idle: high-Z so we don't continuously load the touch circuit
 void pinIdle(int pin) {
-#ifdef CAP_MODE
-    // With capacitor: idle = LOW (cap uncharged = no injection)
-    pinMode(pin, OUTPUT);
-    digitalWrite(pin, LOW);
-#else
-    // Direct mode: idle = high-impedance (don't load the touch circuit)
     pinMode(pin, INPUT);
-#endif
 }
 
+// Touch: pull LOW → conductance path to GND mimics finger
+// Longer pulse compensates for board's 1kΩ series resistors (R22/R10)
 void touchPress(int pin) {
-#ifdef CAP_MODE
-    // With capacitor: pulse HIGH → cap charges → injects charge into electrode
-    pinMode(pin, OUTPUT);
-    digitalWrite(pin, HIGH);
+    digitalWrite(pin, LOW);           // Pull electrode toward GND
     delay(TOUCH_PULSE_MS);
-    pinIdle(pin);
-#else
-    // Direct mode: briefly pull LOW → adds conductance path to GND
-    pinMode(pin, OUTPUT);
-    digitalWrite(pin, LOW);
-    delay(TOUCH_PULSE_MS);
-    pinIdle(pin);
-#endif
+    pinMode(pin, INPUT);              // Release to high-Z
     delay(TOUCH_SETTLE_MS);
+    pinMode(pin, OUTPUT);
+    digitalWrite(pin, LOW);           // Return to idle LOW
 }
 
 // N presses, separated by gapMs
@@ -106,21 +87,16 @@ void touchMulti(int pin, int count, int gapMs = PRESS_GAP_MS) {
     }
 }
 
-// Hold press for durationMs (used for power-off)
+// Hold: pull LOW for durationMs then release to high-Z
 void touchHold(int pin, int durationMs) {
-#ifdef CAP_MODE
-    pinMode(pin, OUTPUT);
-    digitalWrite(pin, HIGH);
-#else
     pinMode(pin, OUTPUT);
     digitalWrite(pin, LOW);
-#endif
     delay(durationMs);
     pinIdle(pin);
 }
 
 // ── Service: Enterprise power switch ──────────────────────────────────────
-//   ON  → tap A (1×), wait 5 s, tap A (3×) = 4 total → Warp Speed Mode
+//   ON  → tap A (1×), wait 5 s, tap A (4×) = 5 total → Warp Speed Mode
 //   OFF → hold A 3.3 s → power-down sequence
 
 struct EnterpriseSwitch : Service::Switch {
@@ -133,27 +109,24 @@ struct EnterpriseSwitch : Service::Switch {
     boolean update() override {
         if (power->getNewVal()) {
             LOG1("Enterprise: Power ON → cycling to Warp Speed Mode\n");
-
-            touchPress(PIN_A);                  // Tap 1 — lights on
-            delay(STARTUP_WAIT_MS);             // Wait for startup animation
-            touchMulti(PIN_A, 4, PRESS_GAP_MS);// Taps 2-5 — Underway → Impulse → Full → Warp
-
+            touchPress(PIN_A);                   // Tap 1 — lights on
+            delay(STARTUP_WAIT_MS);              // Wait for startup animation
+            touchMulti(PIN_A, 4, PRESS_GAP_MS); // Taps 2-5 → Warp Speed
         } else {
             LOG1("Enterprise: Power OFF → sending hold sequence\n");
-
             touchHold(PIN_A, POWER_OFF_HOLD_MS);
         }
-
         return true;
     }
 };
 
-// ── Service: Weapons / Battle Mode (auto-resets to OFF) ────────────────────
+// ── Service: Weapons / Battle Mode ────────────────────────────────────────
 //   ON → triple-tap B (1 s apart) → Battle Mode engages
-//   Auto-resets so the switch can be triggered again without toggling off first
+//   Auto-resets to OFF via loop() to avoid HomeSpan update() conflict
 
 struct WeaponsSwitch : Service::Switch {
     SpanCharacteristic *power;
+    unsigned long resetAt = 0;        // millis() timestamp to reset switch
 
     WeaponsSwitch() : Service::Switch() {
         power = new Characteristic::On(false);
@@ -162,15 +135,18 @@ struct WeaponsSwitch : Service::Switch {
     boolean update() override {
         if (power->getNewVal()) {
             LOG1("Enterprise: FIRE — Battle Mode\n");
-
-            touchMulti(PIN_B, 3, 1000);         // Triple-tap B, 1 s apart
-
-            // Brief pause, then auto-reset to OFF in HomeKit
-            delay(300);
-            power->setVal(false);
+            touchMulti(PIN_B, 3, 1000);          // Triple-tap B, 1 s apart
+            resetAt = millis() + 300;            // Schedule reset in 300 ms
         }
-        // Ignore the OFF transition (it's internal / auto-reset)
         return true;
+    }
+
+    // loop() runs every HomeSpan poll cycle — safe place to set characteristic
+    void loop() override {
+        if (resetAt > 0 && millis() >= resetAt) {
+            power->setVal(false);                // Reset switch to OFF
+            resetAt = 0;
+        }
     }
 };
 
@@ -179,14 +155,13 @@ struct WeaponsSwitch : Service::Switch {
 void setup() {
     Serial.begin(115200);
 
-    // Start both pins in idle state — don't disturb the touch circuit on boot
+    // Initialise pins to high-Z at boot — don't load touch circuit
     pinIdle(PIN_A);
     pinIdle(PIN_B);
 
     homeSpan.setLogLevel(1);
     homeSpan.setPairingCode("47392615");   // HomeKit pairing code: 473-92-615
 
-    // "Enterprise-Bridge" is the name shown during HomeKit pairing
     homeSpan.begin(Category::Bridges, "Enterprise-Bridge");
 
     // ── Accessory 1: Power ──────────────────────────────────────────
