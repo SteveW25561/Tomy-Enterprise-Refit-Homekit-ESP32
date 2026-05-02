@@ -184,6 +184,7 @@ void setup() {
     pinIdle(PIN_B);
 
     homeSpan.setLogLevel(1);
+    homeSpan.setPairingCode("47392615");   // HomeKit pairing code: 473-92-615
 
     // "Enterprise-Bridge" is the name shown during HomeKit pairing
     homeSpan.begin(Category::Bridges, "Enterprise-Bridge");
