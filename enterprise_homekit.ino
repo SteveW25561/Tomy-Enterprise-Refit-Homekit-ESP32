@@ -1,192 +1,480 @@
 /*
- * ╔══════════════════════════════════════════════════════════════╗
- * ║  USS Enterprise HomeKit Controller                           ║
- * ║  Tomy Enterprise Refit → ESP32-S3 → HomeKit via HomeSpan    ║
- * ╚══════════════════════════════════════════════════════════════╝
+ * ╔══════════════════════════════════════════════════════════════════════╗
+ * ║  USS Enterprise NCC-1701 — Combined Controller                       ║
+ * ║  HomeKit + Web Interface + Home Assistant (MQTT)                     ║
+ * ║  Tomy Enterprise Refit → ESP32-S3                                    ║
+ * ╚══════════════════════════════════════════════════════════════════════╝
  *
  * WIRING
  * ──────
- *   GPIO 4  →  220Ω  →  [47-100pF cap]  →  Pad A  (Mode Select)
- *   GPIO 5  →  220Ω  →  [47-100pF cap]  →  Pad B  (Fire Control)
- *   GND     →                               Pad G  (shared ground)
+ *   GPIO 4 → 220Ω → PN2222 Base → Collector to Electrode A (Mode Select)
+ *   GPIO 5 → 220Ω → PN2222 Base → Collector to Electrode B (Fire Control)
+ *   Both PN2222 Emitters → GND (Pad G on sub-board)
  *
- *   The capacitor is required. Place it in series between the 220Ω
- *   resistor and the touch pad. A 47pF or 100pF ceramic cap works well.
+ *   Connect to COPPER ELECTRODE PLATE on back of each sub-board.
+ *   GPIO HIGH = transistor ON = electrode to GND = touch registered.
  *
- * TOUCH SIMULATION — capacitor charge injection
- * ─────────────────────────────────────────────
- * The board already has 1kΩ series resistors (R22/R10) before the
- * touch IC, making direct LOW-pull insufficient. Charge injection used:
+ * INTERFACES
+ * ──────────
+ *   HomeKit  : pair via Home app, code 836-17-294
+ *   Web UI   : http://<ESP32_IP>:8080
+ *   Home Asst: auto-discovered via MQTT (set MQTT_BROKER below)
  *
- *   Idle  = OUTPUT LOW  (cap uncharged — no effect on electrode)
- *   Touch = OUTPUT HIGH briefly (cap charges → injects charge pulse
- *           into electrode, mimicking finger capacitance)
- *   Release = OUTPUT LOW again (cap discharges — touch ends)
+ * HOMEKIT ACCESSORIES (all momentary — no state confusion)
+ * ─────────────────────────────────────────────────────────
+ *   Power ON         momentary → tap A, 17s wait, 3× A (2s apart) → Warp
+ *   Power OFF        momentary → hold A 5 s
+ *   Power Mode       momentary → single press A
+ *   Weapons          momentary → single press B
+ *   Fire 2 Torpedoes momentary → double tap B, 0.5 s apart
+ *   Fire Everything  momentary → triple tap B, 0.5 s apart (Battle Mode)
  *
- * HOMEKIT ACCESSORIES (appear as two switches in the Home app)
- * ─────────────────────────────────────────────────────────────
- *   "USS Enterprise"    ON  → tap A once, wait 5 s, tap A 4 more times
- *                             (turns on → cycles to Warp Speed Mode)
- *                       OFF → hold A for 3.3 s (power-down sequence)
+ * MQTT / HOME ASSISTANT
+ * ──────────────────────
+ *   Set MQTT_BROKER to enable. Leave empty "" to disable.
+ *   Entities auto-appear in HA on first connection.
  *
- *   "Photon Torpedoes"  ON  → triple-tap B, 1 s apart (Battle Mode)
- *                             (auto-resets to OFF so it can be re-fired)
+ * FIRST-TIME SETUP
+ * ────────────────
+ *   1. Set MQTT_BROKER below (or leave "" to skip)
+ *   2. Upload sketch
+ *   3. Serial Monitor 115200 → type  W <SSID> <password>  → Enter
+ *   4. Reboot — note IP address printed
+ *   5. Home app → Add Accessory → More options → 836-17-294
+ *   6. Web UI: http://<IP>:8080
  *
- * FIRST-TIME SETUP (after flashing)
- * ──────────────────────────────────
- *   1. Open Serial Monitor at 115200 baud
- *   2. Type  W <SSID> <password>  then press Enter
- *   3. Reboot; the ESP32 joins WiFi and announces itself
- *   4. Open iPhone Home app → Add Accessory → "More options"
- *      → choose "Enterprise Bridge" → enter code:  473-92-615
- *   5. Accept both accessories when prompted
- *
- * LIBRARY
- * ───────
- *   HomeSpan 2.x — install via Arduino Library Manager
- *   Board: "ESP32S3 Dev Module"
- *   USB CDC on Boot: Enabled (if using the USB-OTG port for serial)
+ * LIBRARIES
+ * ─────────
+ *   HomeSpan 2.x, PubSubClient — Arduino Library Manager
+ *   Board: ESP32S3 Dev Module, USB CDC on Boot: Enabled
  */
 
+// ── MQTT Configuration ─────────────────────────────────────────────────────
+#define MQTT_BROKER  ""       // ← Set to broker IP to enable, e.g. "192.168.1.10"
+#define MQTT_PORT    1883
+#define MQTT_USER    ""       // Leave empty if no auth required
+#define MQTT_PASS    ""
+#define MQTT_ID      "enterprise_ncc1701"
+
+// ── Includes ───────────────────────────────────────────────────────────────
 #include "HomeSpan.h"
+#include <WebServer.h>
+#include <WiFiClient.h>
+#include <PubSubClient.h>
 
-// ── Pin assignments ────────────────────────────────────────────────────────
-static constexpr int PIN_A = 4;   // Mode Select
-static constexpr int PIN_B = 5;   // Fire Control
+// ── Pins ───────────────────────────────────────────────────────────────────
+static constexpr int PIN_A = 4;
+static constexpr int PIN_B = 5;
 
-// ── Timing (ms) ───────────────────────────────────────────────────────────
-static constexpr int TOUCH_PULSE_MS    =  500;   // Long pulse to compensate for board series resistance   // Charge injection duration
-static constexpr int TOUCH_SETTLE_MS   =   50;   // Settle time after release
-static constexpr int PRESS_GAP_MS      = 1000;   // Gap between repeated presses
-static constexpr int POWER_OFF_HOLD_MS = 3300;   // Hold duration for OFF
-static constexpr int STARTUP_WAIT_MS   = 5000;   // Wait for startup animation
+// ── Timing ─────────────────────────────────────────────────────────────────
+static constexpr int PRESS_MS        =  200;   // Single press duration (HIGH)
+static constexpr int SETTLE_MS       =  100;   // Settle after release
+static constexpr int STARTUP_WAIT_MS = 17000;  // Wait after tap 1 for animation
+static constexpr int WARP_GAP_MS     =  2000;  // Between mode-cycle presses
+static constexpr int TORPEDO_GAP_MS  =   500;  // Between torpedo presses
+static constexpr int POWEROFF_MS     =  5000;  // Hold A for power-down
 
-// ── Touch simulation — capacitor charge injection ──────────────────────────
+// ── MQTT ───────────────────────────────────────────────────────────────────
+WiFiClient   wifiClient;
+PubSubClient mqtt(wifiClient);
 
-// Idle: high-Z so we don't continuously load the touch circuit
-void pinIdle(int pin) {
-    pinMode(pin, INPUT);
+#define T_POWER_ON_CMD  "enterprise/power_on/set"
+#define T_POWER_OFF_CMD "enterprise/power_off/set"
+#define T_PRESS_A_CMD   "enterprise/press_a/set"
+#define T_PRESS_B_CMD   "enterprise/press_b/set"
+#define T_FIRE2_CMD     "enterprise/fire2/set"
+#define T_FIRE3_CMD     "enterprise/fire3/set"
+
+// ── Web UI (runs on Core 0 via FreeRTOS task) ──────────────────────────────
+WebServer webUI(8080);
+
+// ── Press primitives ───────────────────────────────────────────────────────
+
+void simPress(int pin) {
+    digitalWrite(pin, HIGH);
+    delay(PRESS_MS);
+    digitalWrite(pin, LOW);
+    delay(SETTLE_MS);
 }
 
-// Touch: pull LOW → conductance path to GND mimics finger
-// Longer pulse compensates for board's 1kΩ series resistors (R22/R10)
-void touchPress(int pin) {
-    digitalWrite(pin, LOW);           // Pull electrode toward GND
-    delay(TOUCH_PULSE_MS);
-    pinMode(pin, INPUT);              // Release to high-Z
-    delay(TOUCH_SETTLE_MS);
-    pinMode(pin, OUTPUT);
-    digitalWrite(pin, LOW);           // Return to idle LOW
-}
-
-// N presses, separated by gapMs
-void touchMulti(int pin, int count, int gapMs = PRESS_GAP_MS) {
+void simMulti(int pin, int count, int gapMs) {
     for (int i = 0; i < count; i++) {
-        touchPress(pin);
+        simPress(pin);
         if (i < count - 1) delay(gapMs);
     }
 }
 
-// Hold: pull LOW for durationMs then release to high-Z
-void touchHold(int pin, int durationMs) {
-    pinMode(pin, OUTPUT);
+void simHold(int pin, int ms) {
+    digitalWrite(pin, HIGH);
+    delay(ms);
     digitalWrite(pin, LOW);
-    delay(durationMs);
-    pinIdle(pin);
+    delay(SETTLE_MS);
 }
 
-// ── Service: Enterprise power switch ──────────────────────────────────────
-//   ON  → tap A (1×), wait 5 s, tap A (4×) = 5 total → Warp Speed Mode
-//   OFF → hold A 3.3 s → power-down sequence
+// ── Actions — shared by HomeKit, Web UI, and MQTT ─────────────────────────
 
-struct EnterpriseSwitch : Service::Switch {
-    SpanCharacteristic *power;
+void actPowerOn() {
+    LOG1("Action: Power ON → Warp Speed\n");
+    simPress(PIN_A);
+    delay(STARTUP_WAIT_MS);
+    simMulti(PIN_A, 3, WARP_GAP_MS);
+}
 
-    EnterpriseSwitch() : Service::Switch() {
-        power = new Characteristic::On(false);
+void actPowerOff() {
+    LOG1("Action: Power OFF\n");
+    simHold(PIN_A, POWEROFF_MS);
+}
+
+void actPressA()  { LOG1("Action: Press A\n");            simPress(PIN_A); }
+void actPressB()  { LOG1("Action: Press B\n");            simPress(PIN_B); }
+void actFire2()   { LOG1("Action: Fire 2 torpedoes\n");   simMulti(PIN_B, 2, TORPEDO_GAP_MS); }
+void actFire3()   { LOG1("Action: Fire everything\n");    simMulti(PIN_B, 3, TORPEDO_GAP_MS); }
+
+// ── MQTT ───────────────────────────────────────────────────────────────────
+
+bool mqttEnabled() { return strlen(MQTT_BROKER) > 0; }
+
+void mqttPublishDiscovery() {
+    String dev = "\"device\":{\"identifiers\":[\"enterprise_ncc1701\"],"
+                 "\"name\":\"USS Enterprise NCC-1701\","
+                 "\"model\":\"Tomy Enterprise Refit\","
+                 "\"manufacturer\":\"Tomy\"}";
+
+    auto btn = [&](const char* uid, const char* name, const char* topic) {
+        String c = "{\"name\":\"" + String(name) + "\","
+                   "\"unique_id\":\"" + String(uid) + "\","
+                   "\"command_topic\":\"" + String(topic) + "\","
+                   "\"payload_press\":\"PRESS\"," + dev + "}";
+        mqtt.publish(("homeassistant/button/" + String(uid) + "/config").c_str(),
+                     c.c_str(), true);
+    };
+
+    btn("enterprise_power_on",  "Power ON → Warp Speed", T_POWER_ON_CMD);
+    btn("enterprise_power_off", "Power OFF",             T_POWER_OFF_CMD);
+    btn("enterprise_press_a",   "Power Mode (Press A)",  T_PRESS_A_CMD);
+    btn("enterprise_press_b",   "Weapons (Press B)",     T_PRESS_B_CMD);
+    btn("enterprise_fire2",     "Fire 2 Torpedoes",      T_FIRE2_CMD);
+    btn("enterprise_fire3",     "Fire Everything",       T_FIRE3_CMD);
+
+    Serial.println("MQTT: HA discovery published");
+}
+
+void mqttCallback(char* topic, byte* payload, unsigned int len) {
+    String t(topic);
+    Serial.printf("MQTT rx: %s\n", topic);
+    if      (t == T_POWER_ON_CMD)  actPowerOn();
+    else if (t == T_POWER_OFF_CMD) actPowerOff();
+    else if (t == T_PRESS_A_CMD)   actPressA();
+    else if (t == T_PRESS_B_CMD)   actPressB();
+    else if (t == T_FIRE2_CMD)     actFire2();
+    else if (t == T_FIRE3_CMD)     actFire3();
+}
+
+void mqttReconnect() {
+    if (WiFi.status() != WL_CONNECTED) return;
+    if (mqtt.connected()) return;
+    Serial.print("MQTT: connecting...");
+    bool ok = (strlen(MQTT_USER) > 0)
+        ? mqtt.connect(MQTT_ID, MQTT_USER, MQTT_PASS)
+        : mqtt.connect(MQTT_ID);
+    if (ok) {
+        Serial.println(" connected");
+        mqtt.subscribe(T_POWER_ON_CMD);
+        mqtt.subscribe(T_POWER_OFF_CMD);
+        mqtt.subscribe(T_PRESS_A_CMD);
+        mqtt.subscribe(T_PRESS_B_CMD);
+        mqtt.subscribe(T_FIRE2_CMD);
+        mqtt.subscribe(T_FIRE3_CMD);
+        mqttPublishDiscovery();
+    } else {
+        Serial.printf(" failed (rc=%d)\n", mqtt.state());
     }
+}
 
+static unsigned long lastMqttAttempt = 0;
+
+void mqttLoop() {
+    if (!mqttEnabled()) return;
+    if (!mqtt.connected()) {
+        unsigned long now = millis();
+        if (now - lastMqttAttempt > 10000) {
+            lastMqttAttempt = now;
+            mqttReconnect();
+        }
+    }
+    mqtt.loop();
+}
+
+// ── HomeKit: Momentary switch ──────────────────────────────────────────────
+// All HomeKit accessories are momentary — no persistent on/off state.
+// This avoids HomeKit timeout issues with long sequences and state confusion
+// since we cannot sense whether the Enterprise is actually on or off.
+
+struct MomentarySwitch : Service::Switch {
+    SpanCharacteristic *on;
+    void (*action)();
+    unsigned long resetAt = 0;
+
+    MomentarySwitch(void (*fn)()) : Service::Switch(), action(fn) {
+        on = new Characteristic::On(false);
+    }
     boolean update() override {
-        if (power->getNewVal()) {
-            LOG1("Enterprise: Power ON → cycling to Warp Speed Mode\n");
-            touchPress(PIN_A);                   // Tap 1 — lights on
-            delay(STARTUP_WAIT_MS);              // Wait for startup animation
-            touchMulti(PIN_A, 4, PRESS_GAP_MS); // Taps 2-5 → Warp Speed
-        } else {
-            LOG1("Enterprise: Power OFF → sending hold sequence\n");
-            touchHold(PIN_A, POWER_OFF_HOLD_MS);
+        if (on->getNewVal()) {
+            action();
+            resetAt = millis() + 500;
         }
         return true;
     }
-};
-
-// ── Service: Weapons / Battle Mode ────────────────────────────────────────
-//   ON → triple-tap B (1 s apart) → Battle Mode engages
-//   Auto-resets to OFF via loop() to avoid HomeSpan update() conflict
-
-struct WeaponsSwitch : Service::Switch {
-    SpanCharacteristic *power;
-    unsigned long resetAt = 0;        // millis() timestamp to reset switch
-
-    WeaponsSwitch() : Service::Switch() {
-        power = new Characteristic::On(false);
-    }
-
-    boolean update() override {
-        if (power->getNewVal()) {
-            LOG1("Enterprise: FIRE — Battle Mode\n");
-            touchMulti(PIN_B, 3, 1000);          // Triple-tap B, 1 s apart
-            resetAt = millis() + 300;            // Schedule reset in 300 ms
-        }
-        return true;
-    }
-
-    // loop() runs every HomeSpan poll cycle — safe place to set characteristic
     void loop() override {
         if (resetAt > 0 && millis() >= resetAt) {
-            power->setVal(false);                // Reset switch to OFF
+            on->setVal(false);
             resetAt = 0;
         }
     }
 };
 
-// ── Setup ──────────────────────────────────────────────────────────────────
+// ── Web UI HTML ────────────────────────────────────────────────────────────
+const char HTML[] PROGMEM = R"rawhtml(
+<!DOCTYPE html><html lang="en"><head>
+<meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>USS Enterprise</title>
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+body{font-family:-apple-system,sans-serif;color:#eee;
+     padding:16px;max-width:420px;margin:0 auto;min-height:100vh;
+     background:url('data:image/jpeg;base64,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') center center/cover fixed;}
+body::before{content:'';position:fixed;inset:0;background:rgba(0,0,10,0.72);z-index:0}
+h1,p,.card,#st{position:relative;z-index:1}
+h1{color:#aaddff;text-align:center;margin:14px 0 2px;font-size:22px;
+    text-shadow:0 0 20px rgba(100,180,255,0.8)}
+.sub{text-align:center;color:#88aacc;font-size:11px;margin-bottom:14px}
+.card{background:rgba(8,8,30,0.82);border:1px solid rgba(80,120,200,0.3);
+      border-radius:12px;padding:14px;margin-bottom:10px;
+      backdrop-filter:blur(6px);position:relative;z-index:1}
+h3{font-size:11px;color:#5599cc;text-transform:uppercase;letter-spacing:1px;margin-bottom:10px}
+.note{font-size:11px;color:#6688aa;margin-bottom:8px;line-height:1.6}.note b{color:#88ccff}
+button{display:block;width:100%;padding:14px;margin:5px 0;font-size:15px;
+       font-weight:500;border:none;border-radius:9px;cursor:pointer;transition:opacity .15s}
+button:active{opacity:.6}
+.a  {background:rgba(20,80,40,0.9);color:#88ee99;border:1px solid #2a7c3a}
+.b  {background:rgba(80,50,0,0.9);color:#ffcc44;border:1px solid #7c5a00}
+.off{background:rgba(80,0,16,0.9);color:#ff7788;border:1px solid #880020}
+.seq{background:rgba(20,20,80,0.9);color:#99aaff;border:1px solid #2a2a8c}
+.row{display:flex;gap:7px}.row button{flex:1;margin:0}
+#st{text-align:center;min-height:26px;padding:5px;border-radius:7px;
+    font-size:13px;margin:7px 0;position:relative;z-index:1}
+#st.ok  {background:rgba(10,42,18,0.9);color:#44dd88}
+#st.busy{background:rgba(26,26,10,0.9);color:#ddcc44}
+#st.err {background:rgba(42,10,10,0.9);color:#dd4444}
+.log{background:rgba(8,8,21,0.85);border:1px solid rgba(26,26,51,0.8);border-radius:6px;
+     padding:8px;font-family:monospace;font-size:11px;color:#6688aa;max-height:72px;
+     overflow-y:auto;margin-top:8px}
+.bar{height:4px;background:rgba(26,26,42,0.8);border-radius:2px;margin-top:8px;overflow:hidden}
+.fill{height:100%;width:0%;background:#44ee88;border-radius:2px;transition:width .2s}
+</style></head><body>
+<h1>🖖 USS Enterprise</h1>
+<p class="sub">NCC-1701 · HomeKit · Home Assistant · Web</p>
 
-void setup() {
-    Serial.begin(115200);
+<div class="card">
+  <h3>Status</h3>
+  <div id="st"></div>
+  <div class="log" id="log">Ready. Awaiting orders.</div>
+  <div class="bar"><div class="fill" id="bar"></div></div>
+</div>
 
-    // Initialise pins to high-Z at boot — don't load touch circuit
-    pinIdle(PIN_A);
-    pinIdle(PIN_B);
+<div class="card">
+  <h3>Single Presses</h3>
+  <div class="row">
+    <button class="a" onclick="go('/pa','Press A',400)">Press A</button>
+    <button class="b" onclick="go('/pb','Press B',400)">Press B</button>
+  </div>
+</div>
 
-    homeSpan.setLogLevel(1);
-    homeSpan.setPairingCode("47392615");   // HomeKit pairing code: 473-92-615
+<div class="card">
+  <h3>Power</h3>
+  <div class="note">
+    <b>ON:</b> Press A → 17s → 3× A (2s apart) → Warp Speed<br>
+    <b>OFF:</b> Hold A for 5 seconds
+  </div>
+  <button class="seq" onclick="go('/power_on','Power ON → Warp Speed (~25 s)',25000)">
+    ⚡ Power ON → Warp Speed
+  </button>
+  <button class="off" onclick="go('/power_off','Power OFF — hold A 5 s',5500)">
+    ■ Power OFF
+  </button>
+</div>
 
-    homeSpan.begin(Category::Bridges, "Enterprise-Bridge");
+<div class="card">
+  <h3>Weapons</h3>
+  <div class="note">
+    <b>Fire 2:</b> Double tap B, 0.5s apart<br>
+    <b>Fire Everything:</b> Triple tap B — Battle Mode
+  </div>
+  <button class="b" onclick="go('/fire2','Fire 2 Torpedoes',1500)">◎◎ Fire 2 Torpedoes</button>
+  <button class="b" onclick="go('/fire3','Fire Everything — Battle Mode',2000)">◎◎◎ Fire Everything</button>
+</div>
 
-    // ── Accessory 1: Power ──────────────────────────────────────────
-    new SpanAccessory();
-        new Service::AccessoryInformation();
-            new Characteristic::Name("USS Enterprise");
-            new Characteristic::Manufacturer("Tomy");
-            new Characteristic::SerialNumber("NCC-1701");
-            new Characteristic::Model("Enterprise Refit");
-            new Characteristic::FirmwareRevision("1.0");
-            new Characteristic::Identify();
-        new EnterpriseSwitch();
+<script>
+var logs=['Ready. Awaiting orders.'];
+function log(m){logs.push(new Date().toLocaleTimeString()+' '+m);
+  if(logs.length>30)logs.shift();
+  var e=document.getElementById('log');e.textContent=logs.join('\n');e.scrollTop=9999;}
+function st(m,c){var e=document.getElementById('st');e.textContent=m;e.className=c||'';}
+function pulse(ms){var b=document.getElementById('bar');
+  b.style.width='100%';setTimeout(function(){b.style.width='0%';},ms);}
+function go(p,l,dur){st('⏳ '+l,'busy');log('→ '+l);pulse(dur||500);
+  fetch(p).then(function(r){return r.text();}).then(function(t){
+    st('✓ '+t,'ok');log('✓ '+t);
+    setTimeout(function(){st('','');},5000);
+  }).catch(function(){st('✗ Failed','err');log('✗ Failed');});}
+</script>
+</body></html>
+)rawhtml";
 
-    // ── Accessory 2: Weapons ────────────────────────────────────────
-    new SpanAccessory();
-        new Service::AccessoryInformation();
-            new Characteristic::Name("Photon Torpedoes");
-            new Characteristic::Manufacturer("Tomy");
-            new Characteristic::SerialNumber("NCC-1701-W");
-            new Characteristic::Model("Enterprise Refit");
-            new Characteristic::FirmwareRevision("1.0");
-            new Characteristic::Identify();
-        new WeaponsSwitch();
+// ── Web UI task (runs on Core 0, HomeSpan runs on Core 1) ─────────────────
+void webTask(void*) {
+    webUI.on("/", [](){
+        webUI.send_P(200, "text/html", HTML);
+    });
+    webUI.on("/pa",        [](){ actPressA();  webUI.send(200,"text/plain","A pressed"); });
+    webUI.on("/pb",        [](){ actPressB();  webUI.send(200,"text/plain","B pressed"); });
+    webUI.on("/power_on",  [](){ webUI.send(200,"text/plain","Power ON sequence running..."); actPowerOn(); });
+    webUI.on("/power_off", [](){ webUI.send(200,"text/plain","Power OFF complete"); actPowerOff(); });
+    webUI.on("/fire2",     [](){ actFire2();   webUI.send(200,"text/plain","2 torpedoes fired"); });
+    webUI.on("/fire3",     [](){ actFire3();   webUI.send(200,"text/plain","Battle Mode — all weapons firing"); });
+    webUI.begin();
+    Serial.println("Web UI started on port 8080");
+    for (;;) {
+        webUI.handleClient();
+        delay(2);
+    }
 }
 
+// ── Setup ───────────────────────────────────────────────────────────────────
+void setup() {
+    // Set pins LOW FIRST — prevents touch IC seeing boot transients
+    pinMode(PIN_A, OUTPUT); digitalWrite(PIN_A, LOW);
+    pinMode(PIN_B, OUTPUT); digitalWrite(PIN_B, LOW);
+    delay(1000);  // Let Enterprise touch IC settle with clean baseline
+
+    Serial.begin(115200);
+    delay(200);
+
+    Serial.println("\n╔════════════════════════════════════════════════╗");
+    Serial.println(  "║      USS Enterprise NCC-1701 Controller        ║");
+    Serial.println(  "╠════════════════════════════════════════════════╣");
+    Serial.println(  "║  HomeKit  →  836-17-294                         ║");
+    Serial.println(  "║  Web UI   →  http://<IP>:8080 (shown on connect)║");
+    if (mqttEnabled()) {
+        Serial.printf("║  MQTT     →  %-34s║\n", MQTT_BROKER);
+    } else {
+        Serial.println("║  MQTT     →  disabled (set MQTT_BROKER to enable)║");
+    }
+    Serial.println(  "╚════════════════════════════════════════════════╝\n");
+
+    // MQTT init (only if configured)
+    if (mqttEnabled()) {
+        mqtt.setServer(MQTT_BROKER, MQTT_PORT);
+        mqtt.setKeepAlive(60);
+        mqtt.setCallback(mqttCallback);
+    }
+
+    // HomeSpan
+    homeSpan.setLogLevel(1);
+    homeSpan.setPairingCode("83617294");  // HomeKit code: 836-17-294
+    homeSpan.begin(Category::Bridges, "Enterprise-Bridge");
+
+    // Power ON (momentary)
+    new SpanAccessory();
+        new Service::AccessoryInformation();
+            new Characteristic::Name("Power ON to Warp");
+            new Characteristic::Manufacturer("Tomy");
+            new Characteristic::SerialNumber("NCC-1701-ON");
+            new Characteristic::Model("Enterprise Refit");
+            new Characteristic::FirmwareRevision("2.0");
+            new Characteristic::Identify();
+        new MomentarySwitch(actPowerOn);
+
+    // Power OFF (momentary)
+    new SpanAccessory();
+        new Service::AccessoryInformation();
+            new Characteristic::Name("Power OFF Enterprise");
+            new Characteristic::Manufacturer("Tomy");
+            new Characteristic::SerialNumber("NCC-1701-OFF");
+            new Characteristic::Model("Enterprise Refit");
+            new Characteristic::FirmwareRevision("2.0");
+            new Characteristic::Identify();
+        new MomentarySwitch(actPowerOff);
+
+    // Power Mode — single press A
+    new SpanAccessory();
+        new Service::AccessoryInformation();
+            new Characteristic::Name("Enterprise Mode (A)");
+            new Characteristic::Manufacturer("Tomy");
+            new Characteristic::SerialNumber("NCC-1701-A");
+            new Characteristic::Model("Enterprise Refit");
+            new Characteristic::FirmwareRevision("2.0");
+            new Characteristic::Identify();
+        new MomentarySwitch(actPressA);
+
+    // Weapons — single press B
+    new SpanAccessory();
+        new Service::AccessoryInformation();
+            new Characteristic::Name("Enterprise Weapons (B)");
+            new Characteristic::Manufacturer("Tomy");
+            new Characteristic::SerialNumber("NCC-1701-B");
+            new Characteristic::Model("Enterprise Refit");
+            new Characteristic::FirmwareRevision("2.0");
+            new Characteristic::Identify();
+        new MomentarySwitch(actPressB);
+
+    // Fire 2 Torpedoes
+    new SpanAccessory();
+        new Service::AccessoryInformation();
+            new Characteristic::Name("Fire 2 Torpedoes");
+            new Characteristic::Manufacturer("Tomy");
+            new Characteristic::SerialNumber("NCC-1701-F2");
+            new Characteristic::Model("Enterprise Refit");
+            new Characteristic::FirmwareRevision("2.0");
+            new Characteristic::Identify();
+        new MomentarySwitch(actFire2);
+
+    // Fire Everything
+    new SpanAccessory();
+        new Service::AccessoryInformation();
+            new Characteristic::Name("Fire Everything");
+            new Characteristic::Manufacturer("Tomy");
+            new Characteristic::SerialNumber("NCC-1701-F3");
+            new Characteristic::Model("Enterprise Refit");
+            new Characteristic::FirmwareRevision("2.0");
+            new Characteristic::Identify();
+        new MomentarySwitch(actFire3);
+
+    // Start web UI on Core 0 (HomeSpan/loop runs on Core 1)
+    // Wait for WiFi first (HomeSpan connects WiFi during poll)
+    Serial.println("Waiting for WiFi before starting Web UI...");
+    while (WiFi.status() != WL_CONNECTED) {
+        homeSpan.poll();
+        delay(10);
+    }
+    String ip = WiFi.localIP().toString();
+    Serial.println("\n╔════════════════════════════════════════════════╗");
+    Serial.println(  "║           ★  ENTERPRISE ONLINE  ★              ║");
+    Serial.println(  "╠════════════════════════════════════════════════╣");
+    Serial.printf(   "║  Web UI   →  http://%-26s║\n", (ip + ":8080").c_str());
+    Serial.println(  "║  HomeKit  →  836-17-294                         ║");
+    if (mqttEnabled()) {
+        Serial.printf("║  MQTT     →  %-34s║\n", MQTT_BROKER);
+    } else {
+        Serial.println("║  MQTT     →  disabled                           ║");
+    }
+    Serial.println(  "╚════════════════════════════════════════════════╝\n");
+
+    xTaskCreatePinnedToCore(webTask, "WebUI", 8192, NULL, 1, NULL, 0);
+}
+
+// ── Loop (Core 1) ──────────────────────────────────────────────────────────
 void loop() {
     homeSpan.poll();
+    mqttLoop();
 }
