@@ -3,6 +3,8 @@
 Control your **Tomy Star Trek Enterprise Refit** model with Apple HomeKit, a browser-based Web UI, and optionally Home Assistant — all running on a single ESP32-S3 board hidden inside the base.
 
 ![](readme/Enterprise%20HomeKit.png)
+
+See it in action here: https://youtu.be/2ChCu2VM8fc?si=r5U2L9rrQbftr_Qt
 ---
 
 ## Features
