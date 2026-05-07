@@ -1,8 +1,8 @@
 # 🖖 Tomy Refit USS Enterprise NCC-1701 HomeKit Controller
 
 Control your **Tomy Star Trek Enterprise Refit** model with Apple HomeKit, a browser-based Web UI, and optionally Home Assistant — all running on a single ESP32-S3 board hidden inside the base.
-![](%F0%9F%96%96%20Tomy%20Refit%20USS%20Enterprise%20NCC-1701%20HomeKit%20Controller/Enterprise%20HomeKit.png)
 
+![](readme/Enterprise%20HomeKit.png)
 ---
 
 ## Features
@@ -23,13 +23,12 @@ Control your **Tomy Star Trek Enterprise Refit** model with Apple HomeKit, a bro
 | 1 | ESP32-S3 Dev Board | [Example on Amazon CA](https://www.amazon.ca/dp/B0DB1WK3CW) — dual USB-C, 16MB flash |
 | 2 | PN2222 NPN transistor | Or any NPN: 2N3904, BC547, S8050 |
 | 2 | 220Ω resistor | Standard ¼W |
-| 1 | Breadboard or perfboard | Breadboard for prototyping; solder to perfboard for permanent install |
-| 1 | USB-C to USB-C cable (short, thin) | Powers the ESP32 from the same supply as the Enterprise — choose a thin/flat cable so it fits inside the base without blocking the Enterprise's own USB-C port |
+| 1 | USB-C to USB-C cable (thinner is better) | Powers the ESP32 from the same supply as the Enterprise — choose a thin/flat cable so it fits inside the base without blocking the Enterprise's own USB-C port |
 | — | Jumper wires with header connectors | For connecting transistors to ESP32 GPIO pins |
 | — | Fine wire (30 AWG recommended) | For connection to touch electrode plates |
 | — | Kapton tape | For securing electrode wires without adding bulk |
 | — | Heat shrink tubing | To insulate soldered joints |
-| 1 | 3D printed oval base cover (STL in repo) | Replaces the original plastic oval cover; allows WiFi signal out and provides ESP32 mounting point |
+| 1 | 3D printed oval base cover (STL in repo) | Replaces the original metal oval cover; allows WiFi signal out and provides ESP32 mounting point |
 
 **Optional:**
 - Small zip ties or cable clips for tidy wire routing inside the base
@@ -141,11 +140,12 @@ In Arduino IDE, configure:
 1. Flip the Enterprise base upside down
 2. Remove the screws holding the main circuit board to the base
 3. There is a plastic shroud surrounding the board's USB-C port — remove this and set it aside
-![](%F0%9F%96%96%20Tomy%20Refit%20USS%20Enterprise%20NCC-1701%20HomeKit%20Controller/IMG_3976.jpeg)
+![]![](readme/IMG_3976.jpeg)
+4. Remove the oval metal cover - this will be replaced by the 3D printed cover to allow WiFi signals out. You can install it now or leave to a later phase to make it easier to work on the base.
 ### Step 2 — Route the ESP32 Power Cable
 
 Thread a thin USB-C cable from **outside** the base housing to the **inside**, near the Enterprise's USB-C power port. This cable will power the ESP32 independently without tapping into the Enterprise's circuitry.
-![](%F0%9F%96%96%20Tomy%20Refit%20USS%20Enterprise%20NCC-1701%20HomeKit%20Controller/IMG_3977.jpeg)
+![]![](readme/IMG_3977.jpeg)
 When you’re ready to mount the ESP 32 board, connect the cable to the **left USB-C port** on the ESP32 (when the board is oriented with the USB ports facing downward). This is the native USB port — with `USB CDC on Boot: Disabled`, it acts as a pure power port during normal use, but also allows you to reflash the ESP32 by simply swapping the cable to your PC or Mac without disassembling the model.
 
 > Choose a thin or flat USB-C cable. It must fit alongside the Enterprise's own power cable without blocking the Enterprise's port.
@@ -155,20 +155,22 @@ When you’re ready to mount the ESP 32 board, connect the cable to the **left U
 
 The two touch button sub-boards are held down by a bracket. Each has a large electrode plate on its back face (the side facing inward toward the housing).
 
-![](%F0%9F%96%96%20Tomy%20Refit%20USS%20Enterprise%20NCC-1701%20HomeKit%20Controller/IMG_3962.jpeg)
+![]
+![](readme/IMG_3962.jpeg)
 1. Unscrew the bracket holding down the capacitive button boards
 2. For each sub-board:
    - Strip ~1.5 cm of a fine jumper wire to expose bare wire
    - Lay the bare wire flat against the **bottom edge** of the copper electrode plate (back of the sub-board)
    - Secure with Kapton tape — use the thinnest tape possible and avoid covering the face of the electrode, as excess thickness will prevent the button from seating properly in its housing
-   - ![](%F0%9F%96%96%20Tomy%20Refit%20USS%20Enterprise%20NCC-1701%20HomeKit%20Controller/IMG_3968.jpeg)
+   - ![]![](readme/IMG_3968.jpeg)
 
 > The wire connected to the electrode plate will trigger the button if you touch it directly — this is expected behaviour since it is electrically part of the electrode.
 
 ### Step 4 — Reinstall Button Sub-boards
 
 Carefully place each sub-board back into its slot in the button housing, routing the electrode wires out to the side. Secure the mounting bracket back into place.
-![](%F0%9F%96%96%20Tomy%20Refit%20USS%20Enterprise%20NCC-1701%20HomeKit%20Controller/image.png)
+![]
+![](readme/image.png)
 
 ### Step 5 — Wire the Transistors
 
@@ -185,33 +187,35 @@ GND wire        →  Emitter pin (left leg)
 ```
 LEFT = Emitter    MIDDLE = Base    RIGHT = Collector
 ```
-
-1. Solder the electrode wire to the **Collector** pin of the transistor
+![](readme/Transistor%20wiring.png)
+1. Solder the touch button electrode wire to the **Collector** pin of the transistor
 2. Solder a 220Ω resistor to the **Base** (middle) pin
 3. Solder a jumper wire to the other end of the resistor — this will connect to the ESP32 GPIO pin
 4. Cover the soldered resistor and wire with heat shrink
 5. Solder a wire to the **Emitter** pin — this will connect to GND
-![](%F0%9F%96%96%20Tomy%20Refit%20USS%20Enterprise%20NCC-1701%20HomeKit%20Controller/Wiring.jpeg)
+![]![](readme/Wiring.jpeg)
+(*note in this image the ground and capactive button wires are soldered to the wrong transistor legs - it still works, but wire according to the siagram above for proper reliability)
 ### Step 6 — Ground Connection
 
 1. Connect the Emitter wire from **both** transistors together to a single ground wire (one GND is sufficient — all grounds on the Enterprise board share a common ground plane)
 2. Strip ~1.5–2 cm of the ground wire end
 3. Connect to the **GND** pin on the ESP32 via a jumper header connector
-![](%F0%9F%96%96%20Tomy%20Refit%20USS%20Enterprise%20NCC-1701%20HomeKit%20Controller/IMG_3988.jpeg)
+![]![](readme/IMG_3988.jpeg)
+(*note in this image the ground and capactive button wires are soldered to the wrong transistor legs - it still works, but wire according to the siagram above for proper reliability)
 ### Step 7 — Connect GPIO Pins
 
-| ESP32 Pin | Connects to |
-|-----------|-------------|
-| GPIO 4 | 220Ω → Transistor Base → Collector to **Electrode A** (Mode Select button) |
-| GPIO 5 | 220Ω → Transistor Base → Collector to **Electrode B** (Fire Control button) |
-| GND | Both transistor Emitters (shared) |
+| ESP32 Pin | Connects to                                                  |
+|-----------|--------------------------------------------------------------|
+| GPIO 4    | 220Ω → Transistor Base <br>Transistor Collector (middle leg) to **Electrode A** (Mode Select button) |
+| GPIO 5    | 220Ω → Transistor Base <br>Transistor Collector (middle leg) to **Electrode B** (Fire Control button) |
+| GND       | Both transistor Emitters (shared)                            |
 
 Connect the GPIO jumper cables from the transistor base resistors to the appropriate header pins on the ESP32.
 
 ### Step 8 — Mount the ESP32
-![](%F0%9F%96%96%20Tomy%20Refit%20USS%20Enterprise%20NCC-1701%20HomeKit%20Controller/IMG_3981.jpeg)
+![]![](readme/IMG_3981.jpeg)
 1. Connect the USB-C power cable you routed in Step 2 to the ESP32
-2. Print the STL file from this repo to make a new oval base cover — this replaces the original plastic cover, allows WiFi signals to pass through, and provides a mounting point for the ESP32
+2. Print the STL file from this repo to make a new oval base cover — this replaces the original metal cover, allows WiFi signals to pass through, and provides a mounting point for the ESP32
 3. Snap or slide the ESP32 board onto the 3D printed oval cover
 
 ### Step 9 — Final Assembly and Test
