@@ -22,7 +22,7 @@ See it in action here: https://youtu.be/2ChCu2VM8fc?si=r5U2L9rrQbftr_Qt
 | # | Item | Notes |
 |---|------|-------|
 | 1 | Tomy Star Trek USS Enterprise Refit | [Tomy product page](https://tomyplus.tomy.com/startrek2024) |
-| 1 | ESP32-S3 Dev Board | [Example on Amazon CA](https://www.amazon.ca/dp/B0DB1WK3CW) — dual USB-C, 16MB flash |
+| 1 | ESP32-S3 Dev Board | [Example on Amazon CA](https://www.amazon.ca/dp/B0DB1WK3CW) — dual USB-C, 16MB flash - I used one without header pins to keep it neat. The 3d printed cover plate works best with no header pins as the mounting bracket needs an edge to grip on to |
 | 2 | PN2222 NPN transistor | Or any NPN: 2N3904, BC547, S8050 |
 | 2 | 220Ω resistor | Standard ¼W |
 | 1 | USB-C to USB-C/USB A cable (thinner is better) | Powers the ESP32 - needs its own power supply — choose a thin/flat cable so it fits inside the base without blocking the Enterprise's own USB-C port |
@@ -35,7 +35,6 @@ See it in action here: https://youtu.be/2ChCu2VM8fc?si=r5U2L9rrQbftr_Qt
 
 **Optional:**
 - Small zip ties or cable clips for tidy wire routing inside the base
-- Double-sided foam tape to mount breadboard/perfboard inside base
 
 ---
 
