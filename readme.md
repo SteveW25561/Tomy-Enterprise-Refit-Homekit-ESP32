@@ -98,7 +98,7 @@ In Arduino IDE, configure:
 | Upload Speed | `921600` |
 | Port | Your ESP32's port (e.g. `/dev/cu.usbmodem...` on Mac, `COM3` on Windows) |
 
-> **USB CDC on Boot — Disabled** means the left USB-C port on the ESP32 acts as a pure power port during normal use, which prevents interference with HomeKit and the Web UI. When you want to update firmware, simply swap the left port cable to your Mac and upload from Arduino IDE as normal — flashing still works without this setting enabled. Once uploaded, swap back to your power supply.
+> **USB CDC on Boot — Disabled** means the left USB-C port on the ESP32 acts as a pure power port during normal use, which prevents interference with HomeKit and the Web UI. When you want to update firmware, simply unplug from the power adapter and plug into to your PC or Mac and upload from Arduino IDE as normal — flashing still works without this setting enabled. Once uploaded, plug back into your power supply. This allows you to reporgam the board without opening up the base again.
 
 ### 6. Upload the Sketch
 
