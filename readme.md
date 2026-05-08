@@ -25,7 +25,8 @@ See it in action here: https://youtu.be/2ChCu2VM8fc?si=r5U2L9rrQbftr_Qt
 | 1 | ESP32-S3 Dev Board | [Example on Amazon CA](https://www.amazon.ca/dp/B0DB1WK3CW) — dual USB-C, 16MB flash |
 | 2 | PN2222 NPN transistor | Or any NPN: 2N3904, BC547, S8050 |
 | 2 | 220Ω resistor | Standard ¼W |
-| 1 | USB-C to USB-C cable (thinner is better) | Powers the ESP32 from the same supply as the Enterprise — choose a thin/flat cable so it fits inside the base without blocking the Enterprise's own USB-C port |
+| 1 | USB-C to USB-C/USB A cable (thinner is better) | Powers the ESP32 - needs its own power supply — choose a thin/flat cable so it fits inside the base without blocking the Enterprise's own USB-C port |
+| 1 | USB-C or USB power supply | A separate power supply for the ESP 32, needed since we aren't touching the model's own power system for safety and ease of installation |
 | — | Jumper wires with header connectors | For connecting transistors to ESP32 GPIO pins |
 | — | Fine wire (30 AWG recommended) | For connection to touch electrode plates |
 | — | Kapton tape | For securing electrode wires without adding bulk |
