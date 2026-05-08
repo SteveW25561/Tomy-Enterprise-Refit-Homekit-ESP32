@@ -103,7 +103,7 @@ In Arduino IDE, configure:
 ### 6. Upload the Sketch
 
 1. Connect ESP32 to your computer via USB-C to the ESP32's left USB port (as seen with the ports facing downward)
-2. OPen the Arduino IDE app and Open the Enterprise_Homekit.ino sketch file 
+2. Open the Arduino IDE app and Open the Enterprise_Homekit.ino sketch file 
 3. Click **Upload** (→ arrow) in Arduino IDE
 4. Wait for "Done uploading"
 
@@ -134,9 +134,6 @@ In Arduino IDE, configure:
 
 > Complete the software setup above first so you know your ESP32 is working and have noted the IP address before you assemble it into the base.
 
-### Overview
-
-![Base interior overview](images/base_interior.jpeg)
 
 ### Step 1 — Open the Base
 
