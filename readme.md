@@ -102,9 +102,10 @@ In Arduino IDE, configure:
 
 ### 6. Upload the Sketch
 
-1. Connect ESP32 to your computer via USB-C
-2. Click **Upload** (→ arrow) in Arduino IDE
-3. Wait for "Done uploading"
+1. Connect ESP32 to your computer via USB-C to the ESP32's left USB port (as seen with the ports facing downward)
+2. OPen the Arduino IDE app and Open the Enterprise_Homekit.ino sketch file 
+3. Click **Upload** (→ arrow) in Arduino IDE
+4. Wait for "Done uploading"
 
 ### 7. Configure WiFi
 
