@@ -58,9 +58,13 @@
 
 // ── Includes ───────────────────────────────────────────────────────────────
 #include "HomeSpan.h"
+#include <Preferences.h>
 #include <WebServer.h>
 #include <WiFiClient.h>
 #include <PubSubClient.h>
+#include "anthem_mp3.h"   // Anthem startup music
+#include "torpedo_mp3.h"  // Torpedo launch sound (~841ms)
+#include "phaser_mp3.h"   // Phaser fire sound (~763ms)
 
 // ── Pins ───────────────────────────────────────────────────────────────────
 static constexpr int PIN_A = 4;
@@ -73,6 +77,31 @@ static constexpr int STARTUP_WAIT_MS = 17000;  // Wait after tap 1 for animation
 static constexpr int WARP_GAP_MS     =  2000;  // Between mode-cycle presses
 static constexpr int TORPEDO_GAP_MS  =   500;  // Between torpedo presses
 static constexpr int POWEROFF_MS     =  5000;  // Hold A for power-down
+
+// ── Anthem Startup timing (tweak independently from Power ON) ──────────────
+// Adjust these to sync button presses with the music
+static constexpr int ANTHEM_STARTUP_WAIT_MS = 17000;  // Wait after tap 1 (startup animation)
+static constexpr int ANTHEM_WARP_GAP_MS     =  2000;  // Gap between presses 2 and 3
+static constexpr int ANTHEM_LAST_GAP_MS     =  2000;  // Gap before final (4th) press — tweak to hit music cue
+
+// ── Sound timing offsets (ms after button press) ──────────────────────────
+// These control when audio plays relative to when the visual effect appears.
+// Positive = audio plays AFTER button press, negative is not possible in JS
+// (browser plays immediately on button tap; these delay the SECOND sound etc.)
+//
+// Button B (single press) — phaser alternates
+static constexpr int SND_PHASER_DELAY_MS      =    0;  // ms after tap before phaser sound starts
+
+// Fire 2 Torpedoes — double tap B, 0.5s apart
+static constexpr int SND_TORP1_DELAY_MS       =    0;  // ms after tap 1 before torpedo 1 sound
+static constexpr int SND_TORP2_DELAY_MS       =  500;  // ms after tap 1 before torpedo 2 sound (matches TORPEDO_GAP_MS)
+
+// Fire Everything — triple tap B
+// Sequence: tap1 → tap2 (0.5s) → tap3 (0.5s)
+// Visuals: torpedo pulses, then phaser banks on saucer illuminate
+static constexpr int SND_ALL_TORP1_DELAY_MS   =    0;  // torpedo 1
+static constexpr int SND_ALL_TORP2_DELAY_MS   =  500;  // torpedo 2
+static constexpr int SND_ALL_PHASER_DELAY_MS  = 1200;  // phasers engage after torpedoes
 
 // ── MQTT ───────────────────────────────────────────────────────────────────
 WiFiClient   wifiClient;
@@ -87,6 +116,80 @@ PubSubClient mqtt(wifiClient);
 
 // ── Web UI (runs on Core 0 via FreeRTOS task) ──────────────────────────────
 WebServer webUI(8080);
+Preferences prefs;
+
+// ── Runtime timing values (loaded from NVS, overridable via Web UI) ────────
+struct Timing {
+    // Button B
+    int phaser_delay      =  1900;
+    // Fire 2
+    int f2_torp1          =  2900;
+    int f2_torp2          =  3200;
+    // Fire Everything
+    int fe_p1             =  3000;
+    int fe_t1             =  4700;
+    int fe_t2             =  5100;
+    int fe_p2             =  5800;
+    int fe_p3             =  8700;
+    int fe_t3             =  9900;
+    int fe_t4             = 10700;
+    int fe_p4             = 11100;
+    int fe_p5             = 11100;
+    // Anthem
+    int anthem_wait       = 17000;
+    int anthem_gap        =  2000;
+    int anthem_last_gap   =  2000;
+} T;
+
+void loadTimings() {
+    prefs.begin("timing", true);  // read-only
+    T.phaser_delay    = prefs.getInt("phaser_delay",    T.phaser_delay);
+    T.f2_torp1        = prefs.getInt("f2_torp1",        T.f2_torp1);
+    T.f2_torp2        = prefs.getInt("f2_torp2",        T.f2_torp2);
+    T.fe_p1           = prefs.getInt("fe_p1",           T.fe_p1);
+    T.fe_t1           = prefs.getInt("fe_t1",           T.fe_t1);
+    T.fe_t2           = prefs.getInt("fe_t2",           T.fe_t2);
+    T.fe_p2           = prefs.getInt("fe_p2",           T.fe_p2);
+    T.fe_p3           = prefs.getInt("fe_p3",           T.fe_p3);
+    T.fe_t3           = prefs.getInt("fe_t3",           T.fe_t3);
+    T.fe_t4           = prefs.getInt("fe_t4",           T.fe_t4);
+    T.fe_p4           = prefs.getInt("fe_p4",           T.fe_p4);
+    T.fe_p5           = prefs.getInt("fe_p5",           T.fe_p5);
+    T.anthem_wait     = prefs.getInt("anthem_wait",     T.anthem_wait);
+    T.anthem_gap      = prefs.getInt("anthem_gap",      T.anthem_gap);
+    T.anthem_last_gap = prefs.getInt("anthem_last_gap", T.anthem_last_gap);
+    prefs.end();
+    Serial.println("Timings loaded from NVS");
+}
+
+void saveTimings() {
+    prefs.begin("timing", false);  // read-write
+    prefs.putInt("phaser_delay",    T.phaser_delay);
+    prefs.putInt("f2_torp1",        T.f2_torp1);
+    prefs.putInt("f2_torp2",        T.f2_torp2);
+    prefs.putInt("fe_p1",           T.fe_p1);
+    prefs.putInt("fe_t1",           T.fe_t1);
+    prefs.putInt("fe_t2",           T.fe_t2);
+    prefs.putInt("fe_p2",           T.fe_p2);
+    prefs.putInt("fe_p3",           T.fe_p3);
+    prefs.putInt("fe_t3",           T.fe_t3);
+    prefs.putInt("fe_t4",           T.fe_t4);
+    prefs.putInt("fe_p4",           T.fe_p4);
+    prefs.putInt("fe_p5",           T.fe_p5);
+    prefs.putInt("anthem_wait",     T.anthem_wait);
+    prefs.putInt("anthem_gap",      T.anthem_gap);
+    prefs.putInt("anthem_last_gap", T.anthem_last_gap);
+    prefs.end();
+    Serial.println("Timings saved to NVS");
+}
+
+void resetTimings() {
+    prefs.begin("timing", false);
+    prefs.clear();
+    prefs.end();
+    T = Timing();  // reset to defaults
+    Serial.println("Timings reset to defaults");
+}
 
 // ── Press primitives ───────────────────────────────────────────────────────
 
@@ -123,6 +226,16 @@ void actPowerOn() {
 void actPowerOff() {
     LOG1("Action: Power OFF\n");
     simHold(PIN_A, POWEROFF_MS);
+}
+
+void actAnthemStartup() {
+    LOG1("Action: Anthem Startup → Warp Speed\n");
+    // Same button sequence as Power ON to Warp — tweak ANTHEM_ constants to sync with music
+    simPress(PIN_A);                              // Tap 1 — lights on
+    delay(T.anthem_wait);               // Wait for startup animation
+    simPress(PIN_A); delay(T.anthem_gap);         // Tap 2 → Underway
+    simPress(PIN_A); delay(T.anthem_last_gap);    // Tap 3 → Impulse/Full Power
+    simPress(PIN_A);                              // Tap 4 → Warp Speed
 }
 
 void actPressA()  { LOG1("Action: Press A\n");            simPress(PIN_A); }
@@ -260,7 +373,13 @@ button:active{opacity:.6}
 .b  {background:rgba(80,50,0,0.9);color:#ffcc44;border:1px solid #7c5a00}
 .off{background:rgba(80,0,16,0.9);color:#ff7788;border:1px solid #880020}
 .seq{background:rgba(20,20,80,0.9);color:#99aaff;border:1px solid #2a2a8c}
+.anthem{background:rgba(60,20,80,0.9);color:#ddaaff;border:1px solid #7a4a9a}
 .row{display:flex;gap:7px}.row button{flex:1;margin:0}
+.tgroup{font-size:11px;color:#88aacc;margin:10px 0 4px;font-weight:600}
+.trow{display:flex;align-items:center;justify-content:space-between;margin:3px 0}
+.trow label{font-size:12px;color:#889;flex:1}
+.trow input{width:80px;background:#0d0d20;border:1px solid #334;border-radius:5px;
+            color:#aaddff;font-size:13px;padding:4px 6px;text-align:right}
 #st{text-align:center;min-height:26px;padding:5px;border-radius:7px;
     font-size:13px;margin:7px 0;position:relative;z-index:1}
 #st.ok  {background:rgba(10,42,18,0.9);color:#44dd88}
@@ -286,7 +405,7 @@ button:active{opacity:.6}
   <h3>Single Presses</h3>
   <div class="row">
     <button class="a" onclick="go('/pa','Press A',400)">Press A</button>
-    <button class="b" onclick="go('/pb','Press B',400)">Press B</button>
+    <button class="b" onclick="pressBSound()">Press B</button>
   </div>
 </div>
 
@@ -299,10 +418,22 @@ button:active{opacity:.6}
   <button class="seq" onclick="go('/power_on','Power ON → Warp Speed (~25 s)',25000)">
     ⚡ Power ON → Warp Speed
   </button>
+  <button class="anthem" onclick="anthemStart()">
+    🎵 Anthem Startup → Warp Speed
+  </button>
   <button class="off" onclick="go('/power_off','Power OFF — hold A 5 s',5500)">
     ■ Power OFF
   </button>
 </div>
+<audio id="anthem"  src="/anthem.mp3"  preload="auto"></audio>
+<audio id="torpedo"  src="/torpedo.mp3" preload="auto"></audio>
+<audio id="torpedo2" src="/torpedo.mp3" preload="auto"></audio>
+<audio id="torpedo3" src="/torpedo.mp3" preload="auto"></audio>
+<audio id="torpedo4" src="/torpedo.mp3" preload="auto"></audio>
+<audio id="phaser"   src="/phaser.mp3"  preload="auto"></audio>
+<audio id="phaser2"  src="/phaser.mp3"  preload="auto"></audio>
+<audio id="phaser3"  src="/phaser.mp3"  preload="auto"></audio>
+<audio id="phaser4"  src="/phaser.mp3"  preload="auto"></audio>
 
 <div class="card">
   <h3>Weapons</h3>
@@ -310,8 +441,8 @@ button:active{opacity:.6}
     <b>Fire 2:</b> Double tap B, 0.5s apart<br>
     <b>Fire Everything:</b> Triple tap B — Battle Mode
   </div>
-  <button class="b" onclick="go('/fire2','Fire 2 Torpedoes',1500)">◎◎ Fire 2 Torpedoes</button>
-  <button class="b" onclick="go('/fire3','Fire Everything — Battle Mode',2000)">◎◎◎ Fire Everything</button>
+  <button class="b" onclick="fire2Sound()">◎◎ Fire 2 Torpedoes</button>
+  <button class="b" onclick="fireAllSound()">◎◎◎ Fire Everything</button>
 </div>
 
 <script>
@@ -322,12 +453,132 @@ function log(m){logs.push(new Date().toLocaleTimeString()+' '+m);
 function st(m,c){var e=document.getElementById('st');e.textContent=m;e.className=c||'';}
 function pulse(ms){var b=document.getElementById('bar');
   b.style.width='100%';setTimeout(function(){b.style.width='0%';},ms);}
+// Play a sound after an optional delay (ms)
+function playAt(id, delayMs) {
+  setTimeout(function() {
+    var a = document.getElementById(id);
+    if (!a) return;
+    a.currentTime = 0;
+    a.play().catch(function(e){ log('Audio error: ' + e.message); });
+  }, delayMs || 0);
+}
+
+// Timing values — defaults shown; overwritten by loadTimings() from ESP32 NVS
+var T = {
+  phaser_delay:1900,
+  f2_torp1:2900,  f2_torp2:3200,
+  fe_p1:3000,     fe_t1:4700,   fe_t2:5100,
+  fe_p2:5800,     fe_p3:8700,
+  fe_t3:9900,     fe_t4:10700,  fe_p4:11100, fe_p5:11100,
+  anthem_wait:17000, anthem_gap:2000, anthem_last_gap:2000
+};
+
+function loadTimings() {
+  fetch('/timing').then(function(r){return r.json();}).then(function(d){
+    T = d;
+    Object.keys(T).forEach(function(k){
+      var el = document.getElementById('t_'+k);
+      if (el) el.value = T[k];
+    });
+  }).catch(function(){
+    // If fetch fails (e.g. page loaded before WiFi), populate with defaults
+    Object.keys(T).forEach(function(k){
+      var el = document.getElementById('t_'+k);
+      if (el) el.value = T[k];
+    });
+  });
+}
+
+function pressBSound() {
+  playAt('phaser', T.phaser_delay);   // single phaser bank
+  go('/pb', 'Press B (Weapons)', 400);
+}
+function fire2Sound() {
+  playAt('torpedo',  T.f2_torp1);   // torpedo 1
+  playAt('torpedo2', T.f2_torp2);   // torpedo 2 (independent, can overlap)
+  go('/fire2', 'Fire 2 Torpedoes', 1500);
+}
+function fireAllSound() {
+  // P → T → T → P → P → T → (T + P + P simultaneous)
+  playAt('phaser',   T.fe_p1);   // [1] Phaser — single bank
+  playAt('torpedo',  T.fe_t1);   // [2] Torpedo 1
+  playAt('torpedo2', T.fe_t2);   // [3] Torpedo 2
+  playAt('phaser2',  T.fe_p2);   // [4] Phaser bank 1
+  playAt('phaser3',  T.fe_p3);   // [5] Phaser bank 2
+  playAt('torpedo3', T.fe_t3);   // [6] Torpedo 3
+  playAt('torpedo4', T.fe_t4);   // [7] Torpedo 4  ─┐
+  playAt('phaser4',  T.fe_p4);   // [7] Phaser 3   ─┤ simultaneous
+  // playAt('phaser5', SND_FE_P5_DELAY); // [7] Phaser 4   ─┘ (add phaser5 audio element if needed)
+  go('/fire3', 'Fire Everything — Battle Mode', 3000);
+}
+function anthemStart() {
+  playAt('anthem', 0);
+  go('/anthem_on', 'Anthem Startup (~25 s)', T.anthem_wait + 7000);
+}
 function go(p,l,dur){st('⏳ '+l,'busy');log('→ '+l);pulse(dur||500);
   fetch(p).then(function(r){return r.text();}).then(function(t){
     st('✓ '+t,'ok');log('✓ '+t);
     setTimeout(function(){st('','');},5000);
   }).catch(function(){st('✗ Failed','err');log('✗ Failed');});}
+
+function tpanel(){
+  var p=document.getElementById('tpanel');
+  p.style.display=p.style.display==='none'?'block':'none';}
+
+function tchange(k,v){
+  T[k]=parseInt(v)||0;}
+
+function tsave(){
+  fetch('/save_timing',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify(T)}).then(function(r){return r.text();}).then(function(t){
+    st('✓ Timings saved','ok');log('✓ Timings saved to device');
+    setTimeout(function(){st('','');},3000);
+  }).catch(function(){st('✗ Save failed','err');});}
+
+function treset(){
+  if(!confirm('Reset all timings to defaults?'))return;
+  fetch('/reset_timing').then(function(){loadTimings();
+    st('✓ Reset to defaults','ok');setTimeout(function(){st('','');},3000);});}
+
+loadTimings();
 </script>
+
+<div class="card" style="margin-top:10px">
+  <h3 onclick="tpanel()" style="cursor:pointer;user-select:none">
+    ⚙ Timing Tweaker <span style="float:right;color:#446">▼ tap to expand</span>
+  </h3>
+  <div id="tpanel" style="display:none">
+    <div class="note" style="margin-bottom:10px">All values in milliseconds from button tap. Changes apply immediately. Press Save to persist across reboots.</div>
+
+    <div class="tgroup"><b>Button B — single phaser</b></div>
+    <div class="trow"><label>Phaser delay</label><input type="number" id="t_phaser_delay" oninput="tchange('phaser_delay',this.value)"></div>
+
+    <div class="tgroup"><b>Fire 2 Torpedoes</b></div>
+    <div class="trow"><label>Torpedo 1</label><input type="number" id="t_f2_torp1" oninput="tchange('f2_torp1',this.value)"></div>
+    <div class="trow"><label>Torpedo 2</label><input type="number" id="t_f2_torp2" oninput="tchange('f2_torp2',this.value)"></div>
+
+    <div class="tgroup"><b>Fire Everything — P→T→T→P→P→T→(T+P+P)</b></div>
+    <div class="trow"><label>[1] Phaser 1</label><input type="number" id="t_fe_p1" oninput="tchange('fe_p1',this.value)"></div>
+    <div class="trow"><label>[2] Torpedo 1</label><input type="number" id="t_fe_t1" oninput="tchange('fe_t1',this.value)"></div>
+    <div class="trow"><label>[3] Torpedo 2</label><input type="number" id="t_fe_t2" oninput="tchange('fe_t2',this.value)"></div>
+    <div class="trow"><label>[4] Phaser 2</label><input type="number" id="t_fe_p2" oninput="tchange('fe_p2',this.value)"></div>
+    <div class="trow"><label>[5] Phaser 3</label><input type="number" id="t_fe_p3" oninput="tchange('fe_p3',this.value)"></div>
+    <div class="trow"><label>[6] Torpedo 3</label><input type="number" id="t_fe_t3" oninput="tchange('fe_t3',this.value)"></div>
+    <div class="trow"><label>[7] Torpedo 4 ┐</label><input type="number" id="t_fe_t4" oninput="tchange('fe_t4',this.value)"></div>
+    <div class="trow"><label>[7] Phaser 4  ┤</label><input type="number" id="t_fe_p4" oninput="tchange('fe_p4',this.value)"></div>
+    <div class="trow"><label>[7] Phaser 5  ┘</label><input type="number" id="t_fe_p5" oninput="tchange('fe_p5',this.value)"></div>
+
+    <div class="tgroup"><b>Anthem Startup</b></div>
+    <div class="trow"><label>Wait after tap 1 (ms)</label><input type="number" id="t_anthem_wait" oninput="tchange('anthem_wait',this.value)"></div>
+    <div class="trow"><label>Gap tap 2→3 (ms)</label><input type="number" id="t_anthem_gap" oninput="tchange('anthem_gap',this.value)"></div>
+    <div class="trow"><label>Gap tap 3→4 (ms)</label><input type="number" id="t_anthem_last_gap" oninput="tchange('anthem_last_gap',this.value)"></div>
+
+    <div style="display:flex;gap:8px;margin-top:10px">
+      <button class="seq" style="font-size:13px;padding:10px" onclick="tsave()">💾 Save to device</button>
+      <button class="off" style="font-size:13px;padding:10px;flex:0 0 auto;width:auto" onclick="treset()">↺ Reset defaults</button>
+    </div>
+  </div>
+</div>
 </body></html>
 )rawhtml";
 
@@ -335,6 +586,85 @@ function go(p,l,dur){st('⏳ '+l,'busy');log('→ '+l);pulse(dur||500);
 void webTask(void*) {
     webUI.on("/", [](){
         webUI.send_P(200, "text/html", HTML);
+    });
+    webUI.on("/anthem.mp3", [](){
+        webUI.sendHeader("Content-Type", "audio/mpeg");
+        webUI.sendHeader("Cache-Control", "public, max-age=86400");
+        webUI.send_P(200, "audio/mpeg", (const char*)ANTHEM_MP3, ANTHEM_MP3_LEN);
+    });
+    webUI.on("/torpedo.mp3", [](){
+        webUI.sendHeader("Content-Type", "audio/mpeg");
+        webUI.sendHeader("Cache-Control", "public, max-age=86400");
+        webUI.send_P(200, "audio/mpeg", (const char*)TORPEDO_MP3, TORPEDO_MP3_LEN);
+    });
+    webUI.on("/phaser.mp3", [](){
+        webUI.sendHeader("Content-Type", "audio/mpeg");
+        webUI.sendHeader("Cache-Control", "public, max-age=86400");
+        webUI.send_P(200, "audio/mpeg", (const char*)PHASER_MP3, PHASER_MP3_LEN);
+    });
+    webUI.on("/anthem_on", [](){ webUI.send(200,"text/plain","Anthem startup running..."); actAnthemStartup(); });
+
+    // Timing API
+    webUI.on("/timing", [](){
+        String j = "{";
+        j += "\"phaser_delay\":"    + String(T.phaser_delay)    + ",";
+        j += "\"f2_torp1\":"        + String(T.f2_torp1)        + ",";
+        j += "\"f2_torp2\":"        + String(T.f2_torp2)        + ",";
+        j += "\"fe_p1\":"           + String(T.fe_p1)           + ",";
+        j += "\"fe_t1\":"           + String(T.fe_t1)           + ",";
+        j += "\"fe_t2\":"           + String(T.fe_t2)           + ",";
+        j += "\"fe_p2\":"           + String(T.fe_p2)           + ",";
+        j += "\"fe_p3\":"           + String(T.fe_p3)           + ",";
+        j += "\"fe_t3\":"           + String(T.fe_t3)           + ",";
+        j += "\"fe_t4\":"           + String(T.fe_t4)           + ",";
+        j += "\"fe_p4\":"           + String(T.fe_p4)           + ",";
+        j += "\"fe_p5\":"           + String(T.fe_p5)           + ",";
+        j += "\"anthem_wait\":"     + String(T.anthem_wait)     + ",";
+        j += "\"anthem_gap\":"      + String(T.anthem_gap)      + ",";
+        j += "\"anthem_last_gap\":" + String(T.anthem_last_gap);
+        j += "}";
+        webUI.send(200, "application/json", j);
+    });
+    webUI.on("/save_timing", HTTP_POST, [](){
+        if (webUI.hasArg("plain")) {
+            String body = webUI.arg("plain");
+            // Parse simple key=value pairs sent as JSON
+            auto getVal = [&](const char* key) -> int {
+                String k = "\"" + String(key) + "\":";
+                int idx = body.indexOf(k);
+                if (idx < 0) return -1;
+                idx += k.length();
+                return body.substring(idx, body.indexOf(',', idx) == -1 ?
+                    body.indexOf('}', idx) : min(body.indexOf(',', idx), body.indexOf('}', idx))).toInt();
+            };
+            auto applyVal = [&](const char* key, int& field) {
+                int v = getVal(key);
+                if (v >= 0) field = v;
+            };
+            applyVal("phaser_delay",    T.phaser_delay);
+            applyVal("f2_torp1",        T.f2_torp1);
+            applyVal("f2_torp2",        T.f2_torp2);
+            applyVal("fe_p1",           T.fe_p1);
+            applyVal("fe_t1",           T.fe_t1);
+            applyVal("fe_t2",           T.fe_t2);
+            applyVal("fe_p2",           T.fe_p2);
+            applyVal("fe_p3",           T.fe_p3);
+            applyVal("fe_t3",           T.fe_t3);
+            applyVal("fe_t4",           T.fe_t4);
+            applyVal("fe_p4",           T.fe_p4);
+            applyVal("fe_p5",           T.fe_p5);
+            applyVal("anthem_wait",     T.anthem_wait);
+            applyVal("anthem_gap",      T.anthem_gap);
+            applyVal("anthem_last_gap", T.anthem_last_gap);
+            saveTimings();
+            webUI.send(200, "text/plain", "Saved");
+        } else {
+            webUI.send(400, "text/plain", "No body");
+        }
+    });
+    webUI.on("/reset_timing", [](){
+        resetTimings();
+        webUI.send(200, "text/plain", "Reset to defaults");
     });
     webUI.on("/pa",        [](){ actPressA();  webUI.send(200,"text/plain","A pressed"); });
     webUI.on("/pb",        [](){ actPressB();  webUI.send(200,"text/plain","B pressed"); });
@@ -355,7 +685,9 @@ void setup() {
     // Set pins LOW FIRST — prevents touch IC seeing boot transients
     pinMode(PIN_A, OUTPUT); digitalWrite(PIN_A, LOW);
     pinMode(PIN_B, OUTPUT); digitalWrite(PIN_B, LOW);
-    delay(1000);  // Let Enterprise touch IC settle with clean baseline
+    delay(1000);
+
+    loadTimings();  // Load saved timing values from NVS  // Let Enterprise touch IC settle with clean baseline
 
     Serial.begin(115200);
     delay(200);
