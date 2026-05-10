@@ -425,15 +425,9 @@ button:active{opacity:.6}
     ■ Power OFF
   </button>
 </div>
-<audio id="anthem"  src="/anthem.mp3"  preload="auto"></audio>
-<audio id="torpedo"  src="/torpedo.mp3" preload="auto"></audio>
-<audio id="torpedo2" src="/torpedo.mp3" preload="auto"></audio>
-<audio id="torpedo3" src="/torpedo.mp3" preload="auto"></audio>
-<audio id="torpedo4" src="/torpedo.mp3" preload="auto"></audio>
-<audio id="phaser"   src="/phaser.mp3"  preload="auto"></audio>
-<audio id="phaser2"  src="/phaser.mp3"  preload="auto"></audio>
-<audio id="phaser3"  src="/phaser.mp3"  preload="auto"></audio>
-<audio id="phaser4"  src="/phaser.mp3"  preload="auto"></audio>
+<!-- Sounds are loaded and played through the Web Audio API (see script
+     below). HTML5 <audio> elements are unreliable on iOS for overlapping /
+     scheduled playback. -->
 
 <div class="card">
   <h3>Weapons</h3>
@@ -453,14 +447,67 @@ function log(m){logs.push(new Date().toLocaleTimeString()+' '+m);
 function st(m,c){var e=document.getElementById('st');e.textContent=m;e.className=c||'';}
 function pulse(ms){var b=document.getElementById('bar');
   b.style.width='100%';setTimeout(function(){b.style.width='0%';},ms);}
-// Play a sound after an optional delay (ms)
+// ─── Audio playback (Web Audio API) ────────────────────────────────────────
+// iOS Safari severely restricts HTML5 <audio>: only the first few elements
+// touched inside a user gesture are unlocked, and setTimeout-delayed play()
+// calls drift / are dropped. The Web Audio API lets us unlock once (per
+// AudioContext), keep MP3s decoded in memory, schedule playback with
+// sample-accurate timing, and overlap as many sources as we want.
+var audioCtx = null;
+var audioBuffers = {};   // name -> decoded AudioBuffer
+var audioRaw     = {};   // name -> ArrayBuffer waiting to be decoded
+var SOUND_NAMES  = ['phaser', 'torpedo', 'anthem'];
+
+// Pre-fetch raw bytes immediately on page load (no AudioContext required).
+SOUND_NAMES.forEach(function(name) {
+  fetch('/' + name + '.mp3')
+    .then(function(r){ return r.arrayBuffer(); })
+    .then(function(b){ audioRaw[name] = b; })
+    .catch(function(e){ log('Load ' + name + ': ' + e.message); });
+});
+
+// Must be called from a user gesture (click) to unlock audio on iOS.
+function ensureAudio() {
+  if (!audioCtx) {
+    var Ctx = window.AudioContext || window.webkitAudioContext;
+    if (!Ctx) return false;
+    audioCtx = new Ctx();
+  }
+  if (audioCtx.state === 'suspended') audioCtx.resume();
+  // Decode anything we've fetched but not yet decoded.
+  SOUND_NAMES.forEach(function(name) {
+    if (audioBuffers[name] || !audioRaw[name]) return;
+    var raw = audioRaw[name];
+    audioRaw[name] = null;
+    audioCtx.decodeAudioData(raw)
+      .then(function(d){ audioBuffers[name] = d; })
+      .catch(function(e){ log('Decode ' + name + ': ' + e.message); });
+  });
+  return true;
+}
+
+// Play a sound after an optional delay (ms). The id may include a numeric
+// suffix (e.g. 'phaser2', 'torpedo3') left over from the old per-element
+// scheme — we map it back to the underlying sound name.
 function playAt(id, delayMs) {
-  setTimeout(function() {
-    var a = document.getElementById(id);
-    if (!a) return;
-    a.currentTime = 0;
-    a.play().catch(function(e){ log('Audio error: ' + e.message); });
-  }, delayMs || 0);
+  if (!ensureAudio()) return;
+  var key = id.replace(/\d+$/, '');
+  var when = audioCtx.currentTime + (delayMs || 0) / 1000;
+  var fire = function() {
+    var buf = audioBuffers[key];
+    if (!buf) return false;
+    var src = audioCtx.createBufferSource();
+    src.buffer = buf;
+    src.connect(audioCtx.destination);
+    src.start(Math.max(when, audioCtx.currentTime));
+    return true;
+  };
+  if (fire()) return;
+  // Buffer not yet decoded — poll briefly, then give up.
+  var tries = 0;
+  var poll = setInterval(function() {
+    if (fire() || ++tries > 100) clearInterval(poll);
+  }, 30);
 }
 
 // Timing values — defaults shown; overwritten by loadTimings() from ESP32 NVS
