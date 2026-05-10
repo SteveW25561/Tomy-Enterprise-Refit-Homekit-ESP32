@@ -91,6 +91,6 @@ anthem_wait: 17000   anthem_gap: 2000   anthem_last_gap: 2000
 Current build has collector/emitter reversed (emitter on electrode, collector to GND) — works in reverse active mode with slightly reduced gain. Does not affect reliability meaningfully and rewiring risks disturbing electrode connections.
 
 ## Future Plans
-- 3D printed oval base cover (STL to be designed) for ESP32 mounting and WiFi signal clearance
+- Update 3d printed cover for ESP32 mounting and speaker/amplifier
 - Optional I2S audio hat (MAX98357A + small speaker) to play sounds from Enterprise itself rather than browser
 - Google Home via Home Assistant bridge (HA already integrated)
