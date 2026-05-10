@@ -10,7 +10,7 @@ See it in action here: https://youtu.be/2ChCu2VM8fc?si=r5U2L9rrQbftr_Qt
 ## Features
 
 - **Apple HomeKit** — 6 controls appear in the Home app; trigger via Siri, automations, or widgets
-- **Web Interface** — browser-based control panel at `http://<IP>:8080`, works on any device on your network
+- **Web Interface** — browser-based control panel at `http://<IP>:8080`, works on any device on your network. Synchronized phaser, torpedo, and Star Trek anthem sounds play through your browser when controlled from a web browser on your local network
 - **Home Assistant** — optional MQTT integration with full auto-discovery (no manual HA configuration needed)
 - **No cloud** — everything runs locally on your home network
 - **Non-destructive** — no permanent modification to the Enterprise; original touch buttons still work
@@ -74,9 +74,29 @@ In Arduino IDE, go to **Tools → Manage Libraries** and install:
 | **HomeSpan** | HomeSpan | Search "HomeSpan" — version 2.x |
 | **PubSubClient** | Nick O'Leary | Required even if not using MQTT |
 
-### 4. Configure the Sketch
+### 4. Download and Open the Sketch
 
-Open `enterprise_homekit.ino` and edit the MQTT section at the top if you want Home Assistant support:
+The sketch and its three embedded sound files live together in the **`enterprise_homekit/`** folder of this repo:
+
+| File | Purpose |
+|------|---------|
+| `enterprise_homekit.ino` | Main sketch |
+| `anthem_mp3.h` | Star Trek anthem played during the power-on sequence |
+| `phaser_mp3.h` | Phaser fire sound |
+| `torpedo_mp3.h` | Photon torpedo launch sound |
+
+The three `*_mp3.h` files contain the MP3 audio embedded as byte arrays — the ESP32 serves them to your browser, which plays them in sync with the lighting effects whenever you trigger a control from the Web UI.
+
+**To get the sketch into Arduino IDE:**
+
+1. Download this repository:
+   - **Easiest:** click the green **Code → Download ZIP** button on GitHub, then unzip it
+   - Or `git clone https://github.com/SteveW25561/Tomy-Enterprise-Refit-Homekit-ESP32.git`
+2. Arduino IDE requires the `.ino` file to live inside a folder of the **same name** — this repo's `enterprise_homekit/` folder is already set up that way. Make sure all four files (`enterprise_homekit.ino`, `anthem_mp3.h`, `phaser_mp3.h`, `torpedo_mp3.h`) stay together in that folder.
+3. In Arduino IDE choose **File → Open…** and select **`enterprise_homekit/enterprise_homekit.ino`**
+4. Confirm the three `.h` sound files appear as tabs across the top of the editor window — if any tab is missing, the audio will not play. Close the sketch and check the folder contents before continuing.
+
+Then edit the MQTT section near the top of the sketch if you want Home Assistant support:
 
 ```cpp
 #define MQTT_BROKER  ""       // Set to your broker IP, e.g. "192.168.1.10"
@@ -250,6 +270,19 @@ http://<ESP32_IP>:8080
 ```
 
 The IP address is shown in Serial Monitor after WiFi connects. You can also find it in your router's device list — it appears as `HomeSpan-...` or `Espressif`.
+
+### Timing Tweaker
+
+Scroll to the bottom of the Web UI and you'll find a collapsible **Timing Tweaker** panel. This lets you fine-tune every delay used by the multi-tap sequences (single phaser, double-tap torpedoes, "Fire Everything" salvo, and the Anthem startup) without re-flashing the ESP32.
+
+![Timing Tweaker panel at the bottom of the Web UI](readme/Timing%20Tweaker.png)
+
+- All values are in **milliseconds, measured from the initial button tap**
+- Edits apply immediately so you can iterate live against the model
+- Press **Save** to persist the values to flash so they survive a reboot
+- If you ever want to return to the defaults, just clear the values or re-flash the sketch
+
+Use this if your particular Enterprise needs a slightly different cadence to keep the sounds locked to the on-model lighting effects.
 
 ---
 
