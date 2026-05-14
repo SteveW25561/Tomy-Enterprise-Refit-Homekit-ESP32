@@ -49,6 +49,9 @@
  *   Board: ESP32S3 Dev Module, USB CDC on Boot: Enabled
  */
 
+// ── Network hostname (shown in router DHCP table) ─────────────────────────
+#define DEVICE_HOSTNAME  "Tomy-Refit-Enterprise"
+
 // ── MQTT Configuration ─────────────────────────────────────────────────────
 #define MQTT_BROKER  ""       // ← Set to broker IP to enable, e.g. "192.168.1.10"
 #define MQTT_PORT    1883
@@ -755,6 +758,7 @@ void setup() {
     // HomeSpan
     homeSpan.setLogLevel(1);
     homeSpan.setPairingCode("83617294");  // HomeKit code: 836-17-294
+    homeSpan.setHostNameSuffix("-" DEVICE_HOSTNAME);
     homeSpan.begin(Category::Bridges, "Enterprise-Bridge");
 
     // Power ON (momentary)
