@@ -138,6 +138,8 @@ void audioTask(void*) {
 
     AudioOutputMixer*     mixer    = new AudioOutputMixer(32, i2sOut);
     AudioOutputMixerStub* stub[2]  = { mixer->NewInput(), mixer->NewInput() };
+    stub[0]->SetGain(0.0f);   // muted until a sound starts; prevents stale-buffer noise
+    stub[1]->SetGain(0.0f);
     QueueHandle_t*        queues[2]= { &torpedoQueue, &phaserQueue };
 
     struct Chan {
@@ -157,6 +159,7 @@ void audioTask(void*) {
             if (c.mp3 && c.mp3->isRunning()) {
                 if (!c.mp3->loop()) {
                     c.mp3->stop();
+                    stub[i]->SetGain(0.0f);  // mute immediately; mixer task keeps running and would otherwise replay stale buffer data
                     delete c.mp3; c.mp3 = nullptr;
                     delete c.src; c.src = nullptr;
                 }
