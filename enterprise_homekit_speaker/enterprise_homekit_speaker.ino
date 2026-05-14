@@ -149,17 +149,21 @@ void audioTask(void*) {
         AudioGeneratorMP3*      mp3 = nullptr;
     } ch[2];
 
+    bool wasActive = false;
+
     for (;;) {
-        uint32_t now = millis();
+        uint32_t now      = millis();
+        bool     anyActive = false;
 
         for (int i = 0; i < 2; i++) {
             Chan& c = ch[i];
 
             // Advance active decoder
             if (c.mp3 && c.mp3->isRunning()) {
+                anyActive = true;
                 if (!c.mp3->loop()) {
                     c.mp3->stop();
-                    stub[i]->SetGain(0.0f);  // mute immediately; mixer task keeps running and would otherwise replay stale buffer data
+                    stub[i]->SetGain(0.0f);
                     delete c.mp3; c.mp3 = nullptr;
                     delete c.src; c.src = nullptr;
                 }
@@ -173,18 +177,29 @@ void audioTask(void*) {
                     c.hasPending = true;
                 }
             }
+            if (c.hasPending) anyActive = true;
 
             // Start decoding when scheduled time arrives
             if (c.hasPending && (int32_t)(now - c.pending.schedMs) >= 0) {
                 c.hasPending = false;
-                // Re-apply gain so volume-slider changes take effect immediately
                 i2sOut->SetGain(speakerVol * I2S_MAX_GAIN);
                 stub[i]->SetGain(1.0f);
                 c.src = new AudioFileSourcePROGMEM(c.pending.data, c.pending.len);
                 c.mp3 = new AudioGeneratorMP3();
                 c.mp3->begin(c.src, stub[i]);
+                anyActive = true;
             }
         }
+
+        // When all sounds finish the ESP32 I2S DMA replays its last buffer
+        // indefinitely (the final non-zero samples of the last sound), causing
+        // a persistent buzz or rattle. Write a block of silence directly to
+        // i2sOut once on the transition to idle to overwrite all DMA buffers.
+        if (wasActive && !anyActive) {
+            int16_t silence[2] = {0, 0};
+            for (int k = 0; k < 2048; k++) i2sOut->ConsumeSample(silence);
+        }
+        wasActive = anyActive;
 
         vTaskDelay(1);
     }
