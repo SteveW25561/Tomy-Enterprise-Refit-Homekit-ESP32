@@ -14,6 +14,7 @@ See it in action here: https://youtu.be/2ChCu2VM8fc?si=r5U2L9rrQbftr_Qt
 - **Home Assistant** — optional MQTT integration with full auto-discovery (no manual HA configuration needed)
 - **No cloud** — everything runs locally on your home network
 - **Non-destructive** — no permanent modification to the Enterprise; original touch buttons still work
+- **Optional built-in speaker** — add a MAX98357A I2S amplifier and a small speaker inside the base so sounds play through the model itself, triggered by HomeKit, Home Assistant, or the Web UI
 
 ---
 
@@ -35,6 +36,14 @@ See it in action here: https://youtu.be/2ChCu2VM8fc?si=r5U2L9rrQbftr_Qt
 
 **Optional:**
 - Small zip ties or cable clips for tidy wire routing inside the base
+
+**Optional — Speaker Add-on:**
+
+| # | Item | Notes |
+|---|------|-------|
+| 1 | MAX98357A I2S Class D Audio Amplifier Module | "MAX98357 I2S Class D Audio Amplifier Module Breakout Interface DAC Decoder Board for Arduino with Dupont Cable 2Pcs" — comes with Dupont cables |
+| 1 | 2" 4Ω 5W Speaker | Fits inside the Enterprise base |
+| — | Jumper wires (male-to-male Dupont) | Included with the amp board |
 
 ---
 
@@ -73,27 +82,35 @@ In Arduino IDE, go to **Tools → Manage Libraries** and install:
 |---------|--------|-------|
 | **HomeSpan** | HomeSpan | Search "HomeSpan" — version 2.x |
 | **PubSubClient** | Nick O'Leary | Required even if not using MQTT |
+| **ESP8266Audio** | Earle Philhower | Required only for the speaker build — search "ESP8266Audio" |
 
 ### 4. Download and Open the Sketch
 
-The sketch and its three embedded sound files live together in the **`enterprise_homekit/`** folder of this repo:
+There are two sketch variants — choose the one that matches your build:
+
+| Sketch folder | Use when |
+|---------------|----------|
+| `enterprise_homekit/` | Standard build — sounds play in your browser only |
+| `enterprise_homekit_speaker/` | Speaker build — sounds play through the MAX98357A amp and speaker inside the base |
+
+Each folder contains the same four files:
 
 | File | Purpose |
 |------|---------|
-| `enterprise_homekit.ino` | Main sketch |
+| `enterprise_homekit.ino` / `enterprise_homekit_speaker.ino` | Main sketch |
 | `anthem_mp3.h` | Star Trek anthem played during the power-on sequence |
 | `phaser_mp3.h` | Phaser fire sound |
 | `torpedo_mp3.h` | Photon torpedo launch sound |
 
-The three `*_mp3.h` files contain the MP3 audio embedded as byte arrays — the ESP32 serves them to your browser, which plays them in sync with the lighting effects whenever you trigger a control from the Web UI.
+The three `*_mp3.h` files contain the MP3 audio embedded as byte arrays. In the standard sketch the ESP32 serves them to your browser. In the speaker sketch the ESP32 decodes and plays them through the I2S amplifier, and can also serve them to the browser depending on the audio mode selected in the Web UI.
 
 **To get the sketch into Arduino IDE:**
 
 1. Download this repository:
    - **Easiest:** click the green **Code → Download ZIP** button on GitHub, then unzip it
    - Or `git clone https://github.com/SteveW25561/Tomy-Enterprise-Refit-Homekit-ESP32.git`
-2. Arduino IDE requires the `.ino` file to live inside a folder of the **same name** — this repo's `enterprise_homekit/` folder is already set up that way. Make sure all four files (`enterprise_homekit.ino`, `anthem_mp3.h`, `phaser_mp3.h`, `torpedo_mp3.h`) stay together in that folder.
-3. In Arduino IDE choose **File → Open…** and select **`enterprise_homekit/enterprise_homekit.ino`**
+2. Arduino IDE requires the `.ino` file to live inside a folder of the **same name** — both `enterprise_homekit/` and `enterprise_homekit_speaker/` are already set up that way. Make sure all four files stay together in whichever folder you use.
+3. In Arduino IDE choose **File → Open…** and select the `.ino` file from your chosen folder
 4. Confirm the three `.h` sound files appear as tabs across the top of the editor window — if any tab is missing, the audio will not play. Close the sketch and check the folder contents before continuing.
 
 Then edit the MQTT section near the top of the sketch if you want Home Assistant support:
@@ -235,7 +252,9 @@ Connect the GPIO jumper cables from the transistor base resistors to the appropr
 ### Step 8 — Mount the ESP32
 ![]![](readme/IMG_3981.jpeg)
 1. Connect the USB-C power cable you routed in Step 2 to the ESP32
-2. Print the STL file from this repo to make a new oval base cover — this replaces the original metal cover, allows WiFi signals to pass through, and provides a mounting point for the ESP32
+2. Print the appropriate STL from the **`Stand covers STL/`** folder:
+   - **Standard build:** `Enterprise stand cover plate.stl`
+   - **Speaker build:** `Enterprise stand cover plate - with speaker.stl` (has a grille cut-out for the 2" speaker)
 3. Snap or slide the ESP32 board onto the 3D printed oval cover
 
 ### Step 9 — Final Assembly and Test
@@ -246,6 +265,63 @@ Connect the GPIO jumper cables from the transistor base resistors to the appropr
 4. Test the physical touch buttons — they should still work normally
 5. Test the Web UI at `http://<your-ESP32-IP>:8080`
 6. Pair with HomeKit using code **836-17-294**
+
+---
+
+## Optional — Speaker Build
+
+> Skip this section if you are not adding a speaker. The standard `enterprise_homekit/` sketch does not require any of the components or steps below.
+
+### Speaker BOM
+
+See the [Bill of Materials](#bill-of-materials) section above for the speaker-specific parts list.
+
+### Speaker Wiring
+
+Wire the MAX98357A amplifier board to the ESP32-S3 as follows:
+
+| MAX98357A Pin | ESP32-S3 Pin | Wire colour suggestion |
+|---------------|--------------|------------------------|
+| BCLK | GPIO 6 | blue |
+| LRC | GPIO 7 | green |
+| DIN | GPIO 8 | yellow |
+| Vin | 3V3 (first pin) | red |
+| SD | 3V3 (second pin) | red |
+| GND | GND | black |
+| GAIN | — | **leave unconnected** |
+| + (speaker terminal) | Speaker + | — |
+| − (speaker terminal) | Speaker − | — |
+
+**GAIN pin:** Leave completely floating — do not connect to anything, no wire and no resistor. The floating state is detected by the MAX98357A as 9 dB gain, which is the correct default. Software volume control in the sketch handles fine adjustment from there.
+
+**Two 3V3 pins:** The ESP32-S3 board has two 3V3 pins both connected to the same internal rail — use one for Vin and the other for SD. No Y-cable needed.
+
+### How the Audio Chain Works
+
+The MAX98357A is an I2S digital audio amplifier. The ESP32-S3 sends compressed MP3 data (decoded on-chip using the **ESP8266Audio** library) as a digital I2S stream over three wires (BCLK, LRC, DIN). The MAX98357A converts the digital stream to an amplified analog output and drives the speaker directly — no separate DAC or analog amplifier is needed.
+
+### Software Volume
+
+The sketch controls volume via the `SetGain()` function in ESP8266Audio. Default is 25% (`speakerVol = 0.25f`, `I2S_MAX_GAIN = 0.5f`). The Web UI volume slider (0–100%) adjusts this in real time and saves to NVS across reboots. Start at 25% and increase to taste — the MAX98357A hardware gain is fixed at 9 dB, so software gain above 0.5× risks clipping.
+
+### Audio Mode Toggle
+
+The Web UI has a **Browser / Speaker** toggle. In **Browser** mode all sounds play on the device running the web interface (original behaviour). In **Speaker** mode all sounds — including those triggered by HomeKit or Home Assistant — play through the I2S amplifier and speaker inside the base.
+
+### Step 10 — Install the Speaker Sketch
+
+Use the sketch in **`enterprise_homekit_speaker/`** instead of `enterprise_homekit/`. Install the **ESP8266Audio** library first (see [Install Libraries](#3-install-libraries) above), then open `enterprise_homekit_speaker/enterprise_homekit_speaker.ino` in Arduino IDE and upload it the same way as the standard sketch.
+
+### Step 11 — Print the Speaker Cover Plate
+
+Print the STL file **`Stand covers STL/Enterprise stand cover plate - with speaker.stl`** instead of the plain cover plate. This version has a grille cut-out sized to fit the 2" speaker over the oval opening in the base.
+
+### Step 12 — Mount the Speaker and Amplifier
+
+1. Fit the 2" speaker into the recess in the 3D printed speaker cover plate, aligning it with the grille cut-out
+2. Mount the MAX98357A board inside the base — the Dupont cables included with the board are long enough to reach the ESP32 GPIO and power pins
+3. Connect the wiring per the table above
+4. Route speaker wires from the amplifier board to the speaker terminals
 
 ---
 
@@ -346,6 +422,14 @@ All controls are available in HomeKit, the Web UI, and Home Assistant.
 **Power sequence unreliable:**
 - The 17-second startup wait may need adjusting — change `STARTUP_WAIT_MS` in the sketch
 - Physical touch buttons on the Enterprise itself always work regardless of ESP32 state
+
+**Speaker not producing sound:**
+- Confirm you uploaded `enterprise_homekit_speaker.ino`, not the standard sketch
+- Check the Web UI audio toggle is set to **Speaker** (not Browser)
+- Verify BCLK → GPIO 6, LRC → GPIO 7, DIN → GPIO 8, Vin and SD both connected to 3V3, GND connected
+- Confirm the GAIN pin is left completely unconnected — any connection here will change the gain or disable output
+- Try increasing volume in the Web UI slider above the 25% default
+- Check the speaker terminal wires are firmly inserted into the MAX98357A screw or spring terminals
 
 ---
 
