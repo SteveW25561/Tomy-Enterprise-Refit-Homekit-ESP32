@@ -134,7 +134,6 @@ struct Timing {
     int fe_t3             =  9900;
     int fe_t4             = 10700;
     int fe_p4             = 11100;
-    int fe_p5             = 11100;
     // Anthem
     int anthem_wait       = 17000;
     int anthem_gap        =  2000;
@@ -154,7 +153,6 @@ void loadTimings() {
     T.fe_t3           = prefs.getInt("fe_t3",           T.fe_t3);
     T.fe_t4           = prefs.getInt("fe_t4",           T.fe_t4);
     T.fe_p4           = prefs.getInt("fe_p4",           T.fe_p4);
-    T.fe_p5           = prefs.getInt("fe_p5",           T.fe_p5);
     T.anthem_wait     = prefs.getInt("anthem_wait",     T.anthem_wait);
     T.anthem_gap      = prefs.getInt("anthem_gap",      T.anthem_gap);
     T.anthem_last_gap = prefs.getInt("anthem_last_gap", T.anthem_last_gap);
@@ -175,7 +173,6 @@ void saveTimings() {
     prefs.putInt("fe_t3",           T.fe_t3);
     prefs.putInt("fe_t4",           T.fe_t4);
     prefs.putInt("fe_p4",           T.fe_p4);
-    prefs.putInt("fe_p5",           T.fe_p5);
     prefs.putInt("anthem_wait",     T.anthem_wait);
     prefs.putInt("anthem_gap",      T.anthem_gap);
     prefs.putInt("anthem_last_gap", T.anthem_last_gap);
@@ -516,7 +513,7 @@ var T = {
   f2_torp1:2900,  f2_torp2:3200,
   fe_p1:3000,     fe_t1:4700,   fe_t2:5100,
   fe_p2:5800,     fe_p3:8700,
-  fe_t3:9900,     fe_t4:10700,  fe_p4:11100, fe_p5:11100,
+  fe_t3:9900,     fe_t4:10700,  fe_p4:11100,
   anthem_wait:17000, anthem_gap:2000, anthem_last_gap:2000
 };
 
@@ -546,16 +543,16 @@ function fire2Sound() {
   go('/fire2', 'Fire 2 Torpedoes', 1500);
 }
 function fireAllSound() {
-  // P → T → T → P → P → T → (T + P + P simultaneous)
+  // P → T → T → P → P → T → (T + P) — phaser banks 4+5 fire visually together,
+  // so we only play one phaser sound at the final beat.
   playAt('phaser',   T.fe_p1);   // [1] Phaser — single bank
   playAt('torpedo',  T.fe_t1);   // [2] Torpedo 1
   playAt('torpedo2', T.fe_t2);   // [3] Torpedo 2
   playAt('phaser2',  T.fe_p2);   // [4] Phaser bank 1
   playAt('phaser3',  T.fe_p3);   // [5] Phaser bank 2
   playAt('torpedo3', T.fe_t3);   // [6] Torpedo 3
-  playAt('torpedo4', T.fe_t4);   // [7] Torpedo 4  ─┐
-  playAt('phaser4',  T.fe_p4);   // [7] Phaser 3   ─┤ simultaneous
-  // playAt('phaser5', SND_FE_P5_DELAY); // [7] Phaser 4   ─┘ (add phaser5 audio element if needed)
+  playAt('torpedo4', T.fe_t4);   // [7] Torpedo 4   ─┐ simultaneous
+  playAt('phaser4',  T.fe_p4);   // [8] Phasers 4   ─┘
   go('/fire3', 'Fire Everything — Battle Mode', 3000);
 }
 function anthemStart() {
@@ -604,16 +601,15 @@ loadTimings();
     <div class="trow"><label>Torpedo 1</label><input type="number" id="t_f2_torp1" oninput="tchange('f2_torp1',this.value)"></div>
     <div class="trow"><label>Torpedo 2</label><input type="number" id="t_f2_torp2" oninput="tchange('f2_torp2',this.value)"></div>
 
-    <div class="tgroup"><b>Fire Everything — P→T→T→P→P→T→(T+P+P)</b></div>
+    <div class="tgroup"><b>Fire Everything — P→T→T→P→P→T→(T+P)</b></div>
     <div class="trow"><label>[1] Phaser 1</label><input type="number" id="t_fe_p1" oninput="tchange('fe_p1',this.value)"></div>
     <div class="trow"><label>[2] Torpedo 1</label><input type="number" id="t_fe_t1" oninput="tchange('fe_t1',this.value)"></div>
     <div class="trow"><label>[3] Torpedo 2</label><input type="number" id="t_fe_t2" oninput="tchange('fe_t2',this.value)"></div>
     <div class="trow"><label>[4] Phaser 2</label><input type="number" id="t_fe_p2" oninput="tchange('fe_p2',this.value)"></div>
     <div class="trow"><label>[5] Phaser 3</label><input type="number" id="t_fe_p3" oninput="tchange('fe_p3',this.value)"></div>
     <div class="trow"><label>[6] Torpedo 3</label><input type="number" id="t_fe_t3" oninput="tchange('fe_t3',this.value)"></div>
-    <div class="trow"><label>[7] Torpedo 4 ┐</label><input type="number" id="t_fe_t4" oninput="tchange('fe_t4',this.value)"></div>
-    <div class="trow"><label>[7] Phaser 4  ┤</label><input type="number" id="t_fe_p4" oninput="tchange('fe_p4',this.value)"></div>
-    <div class="trow"><label>[7] Phaser 5  ┘</label><input type="number" id="t_fe_p5" oninput="tchange('fe_p5',this.value)"></div>
+    <div class="trow"><label>[7] Torpedo 4</label><input type="number" id="t_fe_t4" oninput="tchange('fe_t4',this.value)"></div>
+    <div class="trow"><label>[8] Phasers 4</label><input type="number" id="t_fe_p4" oninput="tchange('fe_p4',this.value)"></div>
 
     <div class="tgroup"><b>Anthem Startup</b></div>
     <div class="trow"><label>Wait after tap 1 (ms)</label><input type="number" id="t_anthem_wait" oninput="tchange('anthem_wait',this.value)"></div>
@@ -665,7 +661,6 @@ void webTask(void*) {
         j += "\"fe_t3\":"           + String(T.fe_t3)           + ",";
         j += "\"fe_t4\":"           + String(T.fe_t4)           + ",";
         j += "\"fe_p4\":"           + String(T.fe_p4)           + ",";
-        j += "\"fe_p5\":"           + String(T.fe_p5)           + ",";
         j += "\"anthem_wait\":"     + String(T.anthem_wait)     + ",";
         j += "\"anthem_gap\":"      + String(T.anthem_gap)      + ",";
         j += "\"anthem_last_gap\":" + String(T.anthem_last_gap);
@@ -699,7 +694,6 @@ void webTask(void*) {
             applyVal("fe_t3",           T.fe_t3);
             applyVal("fe_t4",           T.fe_t4);
             applyVal("fe_p4",           T.fe_p4);
-            applyVal("fe_p5",           T.fe_p5);
             applyVal("anthem_wait",     T.anthem_wait);
             applyVal("anthem_gap",      T.anthem_gap);
             applyVal("anthem_last_gap", T.anthem_last_gap);
