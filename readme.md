@@ -167,7 +167,7 @@ In Arduino IDE, configure:
    ║  HomeKit  →  836-17-294                         ║
    ╚════════════════════════════════════════════════╝
    ```
-5. **Note your IP address** — you will need it for the Web UI and to verify your setup later
+5. **Note your IP address** — you will need it for the Web UI and to verify your setup later. The device registers on your network as **`Tomy-Refit-Enterprise`**, so you can also find its IP address in your router's DHCP client table by looking for that name if you ever need it again.
 
 ---
 
