@@ -272,6 +272,8 @@ Connect the GPIO jumper cables from the transistor base resistors to the appropr
 
 > Skip this section if you are not adding a speaker. The standard `enterprise_homekit/` sketch does not require any of the components or steps below.
 
+![](readme/Speaker%20cover.png)
+
 ### Speaker BOM
 
 See the [Bill of Materials](#bill-of-materials) section above for the speaker-specific parts list.
@@ -322,6 +324,9 @@ Print the STL file **`Stand covers STL/Enterprise stand cover plate - with speak
 2. Mount the MAX98357A board inside the base — the Dupont cables included with the board are long enough to reach the ESP32 GPIO and power pins
 3. Connect the wiring per the table above
 4. Route speaker wires from the amplifier board to the speaker terminals
+
+![](readme/speaker-cover-plate-back.jpeg.png)
+![](readme/speaker-installed-base.jpeg.png)
 
 ---
 
