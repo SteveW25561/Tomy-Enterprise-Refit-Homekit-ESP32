@@ -42,8 +42,12 @@ See it in action here: https://youtu.be/2ChCu2VM8fc?si=r5U2L9rrQbftr_Qt
 | # | Item | Notes |
 |---|------|-------|
 | 1 | MAX98357A I2S Class D Audio Amplifier Module | "MAX98357 I2S Class D Audio Amplifier Module Breakout Interface DAC Decoder Board for Arduino with Dupont Cable 2Pcs" — comes with Dupont cables |
-| 1 | 2" 4Ω 5W Speaker | Fits inside the Enterprise base |
+| 1 | [2" 4Ω 5W Speaker](https://www.amazon.ca/dp/B081169PC5?ref=ppx_yo2ov_dt_b_fed_asin_title) | This speaker is larger than others, but still fits in the base and sounds less tinny with deeper bass than thinner, cheaper speakers |
+| 4 | M3 screws and nuts | To mount the speaker to the 3D printed cover plate |
 | — | Jumper wires (male-to-male Dupont) | Included with the amp board |
+
+![](readme/Speakers.png)
+![](readme/Speaker%20dimensions.png)
 
 ---
 
@@ -272,6 +276,8 @@ Connect the GPIO jumper cables from the transistor base resistors to the appropr
 
 > Skip this section if you are not adding a speaker. The standard `enterprise_homekit/` sketch does not require any of the components or steps below.
 
+![](readme/Speaker%20cover.png)
+
 ### Speaker BOM
 
 See the [Bill of Materials](#bill-of-materials) section above for the speaker-specific parts list.
@@ -322,6 +328,9 @@ Print the STL file **`Stand covers STL/Enterprise stand cover plate - with speak
 2. Mount the MAX98357A board inside the base — the Dupont cables included with the board are long enough to reach the ESP32 GPIO and power pins
 3. Connect the wiring per the table above
 4. Route speaker wires from the amplifier board to the speaker terminals
+
+![](readme/speaker-cover-plate-back.jpeg.png)
+![](readme/speaker-installed-base.jpeg.png)
 
 ---
 
