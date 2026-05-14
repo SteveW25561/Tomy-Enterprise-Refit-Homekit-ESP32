@@ -89,6 +89,7 @@
 #include <AudioFileSourcePROGMEM.h>
 #include <AudioGeneratorMP3.h>
 #include <AudioOutputI2S.h>
+#include <AudioOutputMixer.h>
 #include "anthem_mp3.h"   // Anthem startup music
 #include "torpedo_mp3.h"  // Torpedo launch sound (~841ms)
 #include "phaser_mp3.h"   // Phaser fire sound (~763ms)
@@ -111,20 +112,23 @@ volatile float speakerVol = 0.25f;   // 0.0–1.0; start quiet so first power-on
 // software scale clips noticeably; keep this conservative.
 #define I2S_MAX_GAIN  0.5f
 
-// ── I2S audio task + scheduled sound queue ─────────────────────────────────
-// scheduleSnd() is non-blocking: it hands a request to the queue and returns.
-// audioTask() pulls requests off the queue, waits until their scheduled time,
-// then decodes & plays the MP3 through the MAX98357A.
+// ── I2S audio task + dual-channel scheduled sound queue ────────────────────
+// Two independent channels feed an AudioOutputMixer so phaser and torpedo
+// sounds can play simultaneously without one blocking the other.
+// Channel 0: torpedo + anthem   Channel 1: phaser
+// scheduleSnd() routes each request to its channel queue and returns immediately.
+// audioTask() services both channels every FreeRTOS tick.
 struct SoundReq { const uint8_t* data; size_t len; uint32_t schedMs; };
-#define SOUND_QUEUE_SIZE 20
-QueueHandle_t  soundQueue = nullptr;
-AudioOutputI2S* i2sOut    = nullptr;
+#define SOUND_QUEUE_SIZE 10
+QueueHandle_t  torpedoQueue = nullptr;
+QueueHandle_t  phaserQueue  = nullptr;
+AudioOutputI2S* i2sOut      = nullptr;
 
 void scheduleSnd(const uint8_t* data, size_t len, uint32_t delayMs) {
     if (audioMode != AUDIO_SPEAKER) return;
-    if (!soundQueue) return;
     SoundReq r = { data, len, millis() + delayMs };
-    xQueueSend(soundQueue, &r, 0);
+    QueueHandle_t q = (data == PHASER_MP3) ? phaserQueue : torpedoQueue;
+    if (q) xQueueSend(q, &r, 0);
 }
 
 void audioTask(void*) {
@@ -132,24 +136,53 @@ void audioTask(void*) {
     i2sOut->SetPinout(I2S_BCLK, I2S_LRC, I2S_DIN);
     i2sOut->SetGain(speakerVol * I2S_MAX_GAIN);
 
-    SoundReq req;
+    AudioOutputMixer*     mixer    = new AudioOutputMixer(32, i2sOut);
+    AudioOutputMixerStub* stub[2]  = { mixer->NewInput(), mixer->NewInput() };
+    QueueHandle_t*        queues[2]= { &torpedoQueue, &phaserQueue };
+
+    struct Chan {
+        bool     hasPending = false;
+        SoundReq pending    = {};
+        AudioFileSourcePROGMEM* src = nullptr;
+        AudioGeneratorMP3*      mp3 = nullptr;
+    } ch[2];
+
     for (;;) {
-        if (xQueueReceive(soundQueue, &req, pdMS_TO_TICKS(5)) == pdTRUE) {
-            int32_t wait = (int32_t)(req.schedMs - millis());
-            if (wait > 0) vTaskDelay(pdMS_TO_TICKS(wait));
+        uint32_t now = millis();
 
-            // Re-apply gain on every play so volume-slider changes take effect
-            // immediately — without this the SetGain() above only runs once.
-            i2sOut->SetGain(speakerVol * I2S_MAX_GAIN);
+        for (int i = 0; i < 2; i++) {
+            Chan& c = ch[i];
 
-            AudioFileSourcePROGMEM src(req.data, req.len);
-            AudioGeneratorMP3 mp3;
-            mp3.begin(&src, i2sOut);
-            while (mp3.isRunning()) {
-                if (!mp3.loop()) { mp3.stop(); break; }
-                vTaskDelay(1);
+            // Advance active decoder
+            if (c.mp3 && c.mp3->isRunning()) {
+                if (!c.mp3->loop()) {
+                    c.mp3->stop();
+                    delete c.mp3; c.mp3 = nullptr;
+                    delete c.src; c.src = nullptr;
+                }
+            }
+
+            // Pull next request when channel is idle
+            if (!c.hasPending && !c.mp3) {
+                SoundReq r;
+                if (xQueueReceive(*queues[i], &r, 0) == pdTRUE) {
+                    c.pending    = r;
+                    c.hasPending = true;
+                }
+            }
+
+            // Start decoding when scheduled time arrives
+            if (c.hasPending && (int32_t)(now - c.pending.schedMs) >= 0) {
+                c.hasPending = false;
+                // Re-apply gain so volume-slider changes take effect immediately
+                i2sOut->SetGain(speakerVol * I2S_MAX_GAIN);
+                stub[i]->SetGain(1.0f);
+                c.src = new AudioFileSourcePROGMEM(c.pending.data, c.pending.len);
+                c.mp3 = new AudioGeneratorMP3();
+                c.mp3->begin(c.src, stub[i]);
             }
         }
+
         vTaskDelay(1);
     }
 }
@@ -347,10 +380,7 @@ void actFire2() {
 
 void actFire3() {
     LOG1("Action: Fire everything\n");
-    // P → T → T → P → P → T → (T + P) — phaser banks 4+5 visually fire together,
-    // so we only schedule one phaser sound for that beat (the I2S audio task
-    // plays sounds sequentially, so a second overlapping phaser would just
-    // play back-to-back instead of doubling up).
+    // P → T → T → P → P → T → (T + P simultaneous)
     scheduleSnd(PHASER_MP3,  PHASER_MP3_LEN,  T.fe_p1);
     scheduleSnd(TORPEDO_MP3, TORPEDO_MP3_LEN, T.fe_t1);
     scheduleSnd(TORPEDO_MP3, TORPEDO_MP3_LEN, T.fe_t2);
@@ -950,8 +980,9 @@ void setup() {
 
     // I2S audio task — created before HomeSpan so the first action (e.g. an
     // Anthem trigger right after reboot) finds the queue ready.
-    soundQueue = xQueueCreate(SOUND_QUEUE_SIZE, sizeof(SoundReq));
-    xTaskCreatePinnedToCore(audioTask, "Audio", 8192, NULL, 2, NULL, 1);
+    torpedoQueue = xQueueCreate(SOUND_QUEUE_SIZE, sizeof(SoundReq));
+    phaserQueue  = xQueueCreate(SOUND_QUEUE_SIZE, sizeof(SoundReq));
+    xTaskCreatePinnedToCore(audioTask, "Audio", 16384, NULL, 2, NULL, 1);
 
     Serial.println("\n╔════════════════════════════════════════════════╗");
     Serial.println(  "║   USS Enterprise NCC-1701 — Speaker Edition    ║");
