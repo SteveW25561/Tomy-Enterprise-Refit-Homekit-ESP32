@@ -42,7 +42,7 @@ See it in action here: https://youtu.be/2ChCu2VM8fc?si=r5U2L9rrQbftr_Qt
 | # | Item | Notes |
 |---|------|-------|
 | 1 | MAX98357A I2S Class D Audio Amplifier Module | "MAX98357 I2S Class D Audio Amplifier Module Breakout Interface DAC Decoder Board for Arduino with Dupont Cable 2Pcs" — comes with Dupont cables |
-| 1 | 2" 4Ω 5W Speaker | Fits inside the Enterprise base |
+| 1 | [2" 4Ω 5W Speaker](https://www.amazon.ca/dp/B081169PC5?ref=ppx_yo2ov_dt_b_fed_asin_title) | This speaker is larger than others, but still fits in the base and sounds less tinny with deeper bass than thinner, cheaper speakers |
 | — | Jumper wires (male-to-male Dupont) | Included with the amp board |
 
 ---
