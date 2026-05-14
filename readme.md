@@ -3,12 +3,14 @@
 Control your **Tomy Star Trek Enterprise Refit** model with Apple HomeKit, a browser-based Web UI, and optionally Home Assistant — all running on a single ESP32-S3 board hidden inside the base.
 
 ![](readme/Enterprise%20HomeKit.png)
+
+See it in action here: https://youtu.be/2ChCu2VM8fc?si=r5U2L9rrQbftr_Qt
 ---
 
 ## Features
 
 - **Apple HomeKit** — 6 controls appear in the Home app; trigger via Siri, automations, or widgets
-- **Web Interface** — browser-based control panel at `http://<IP>:8080`, works on any device on your network
+- **Web Interface** — browser-based control panel at `http://<IP>:8080`, works on any device on your network. Synchronized phaser, torpedo, and Star Trek anthem sounds play through your browser when controlled from a web browser on your local network
 - **Home Assistant** — optional MQTT integration with full auto-discovery (no manual HA configuration needed)
 - **No cloud** — everything runs locally on your home network
 - **Non-destructive** — no permanent modification to the Enterprise; original touch buttons still work
@@ -20,10 +22,11 @@ Control your **Tomy Star Trek Enterprise Refit** model with Apple HomeKit, a bro
 | # | Item | Notes |
 |---|------|-------|
 | 1 | Tomy Star Trek USS Enterprise Refit | [Tomy product page](https://tomyplus.tomy.com/startrek2024) |
-| 1 | ESP32-S3 Dev Board | [Example on Amazon CA](https://www.amazon.ca/dp/B0DB1WK3CW) — dual USB-C, 16MB flash |
+| 1 | ESP32-S3 Dev Board | [Example on Amazon CA](https://www.amazon.ca/dp/B0DB1WK3CW) — dual USB-C, 16MB flash - I used one without header pins to keep it neat. The 3d printed cover plate works best with no header pins as the mounting bracket needs an edge to grip on to |
 | 2 | PN2222 NPN transistor | Or any NPN: 2N3904, BC547, S8050 |
 | 2 | 220Ω resistor | Standard ¼W |
-| 1 | USB-C to USB-C cable (thinner is better) | Powers the ESP32 from the same supply as the Enterprise — choose a thin/flat cable so it fits inside the base without blocking the Enterprise's own USB-C port |
+| 1 | USB-C to USB-C/USB A cable (thinner is better) | Powers the ESP32 - needs its own power supply — choose a thin/flat cable so it fits inside the base without blocking the Enterprise's own USB-C port |
+| 1 | USB-C or USB power supply | A separate power supply for the ESP 32, needed since we aren't touching the model's own power system for safety and ease of installation |
 | — | Jumper wires with header connectors | For connecting transistors to ESP32 GPIO pins |
 | — | Fine wire (30 AWG recommended) | For connection to touch electrode plates |
 | — | Kapton tape | For securing electrode wires without adding bulk |
@@ -32,7 +35,6 @@ Control your **Tomy Star Trek Enterprise Refit** model with Apple HomeKit, a bro
 
 **Optional:**
 - Small zip ties or cable clips for tidy wire routing inside the base
-- Double-sided foam tape to mount breadboard/perfboard inside base
 
 ---
 
@@ -72,9 +74,29 @@ In Arduino IDE, go to **Tools → Manage Libraries** and install:
 | **HomeSpan** | HomeSpan | Search "HomeSpan" — version 2.x |
 | **PubSubClient** | Nick O'Leary | Required even if not using MQTT |
 
-### 4. Configure the Sketch
+### 4. Download and Open the Sketch
 
-Open `enterprise_homekit.ino` and edit the MQTT section at the top if you want Home Assistant support:
+The sketch and its three embedded sound files live together in the **`enterprise_homekit/`** folder of this repo:
+
+| File | Purpose |
+|------|---------|
+| `enterprise_homekit.ino` | Main sketch |
+| `anthem_mp3.h` | Star Trek anthem played during the power-on sequence |
+| `phaser_mp3.h` | Phaser fire sound |
+| `torpedo_mp3.h` | Photon torpedo launch sound |
+
+The three `*_mp3.h` files contain the MP3 audio embedded as byte arrays — the ESP32 serves them to your browser, which plays them in sync with the lighting effects whenever you trigger a control from the Web UI.
+
+**To get the sketch into Arduino IDE:**
+
+1. Download this repository:
+   - **Easiest:** click the green **Code → Download ZIP** button on GitHub, then unzip it
+   - Or `git clone https://github.com/SteveW25561/Tomy-Enterprise-Refit-Homekit-ESP32.git`
+2. Arduino IDE requires the `.ino` file to live inside a folder of the **same name** — this repo's `enterprise_homekit/` folder is already set up that way. Make sure all four files (`enterprise_homekit.ino`, `anthem_mp3.h`, `phaser_mp3.h`, `torpedo_mp3.h`) stay together in that folder.
+3. In Arduino IDE choose **File → Open…** and select **`enterprise_homekit/enterprise_homekit.ino`**
+4. Confirm the three `.h` sound files appear as tabs across the top of the editor window — if any tab is missing, the audio will not play. Close the sketch and check the folder contents before continuing.
+
+Then edit the MQTT section near the top of the sketch if you want Home Assistant support:
 
 ```cpp
 #define MQTT_BROKER  ""       // Set to your broker IP, e.g. "192.168.1.10"
@@ -96,13 +118,14 @@ In Arduino IDE, configure:
 | Upload Speed | `921600` |
 | Port | Your ESP32's port (e.g. `/dev/cu.usbmodem...` on Mac, `COM3` on Windows) |
 
-> **USB CDC on Boot — Disabled** means the left USB-C port on the ESP32 acts as a pure power port during normal use, which prevents interference with HomeKit and the Web UI. When you want to update firmware, simply swap the left port cable to your Mac and upload from Arduino IDE as normal — flashing still works without this setting enabled. Once uploaded, swap back to your power supply.
+> **USB CDC on Boot — Disabled** means the left USB-C port on the ESP32 acts as a pure power port during normal use, which prevents interference with HomeKit and the Web UI. When you want to update firmware, simply unplug from the power adapter and plug into to your PC or Mac and upload from Arduino IDE as normal — flashing still works without this setting enabled. Once uploaded, plug back into your power supply. This allows you to reporgam the board without opening up the base again.
 
 ### 6. Upload the Sketch
 
-1. Connect ESP32 to your computer via USB-C
-2. Click **Upload** (→ arrow) in Arduino IDE
-3. Wait for "Done uploading"
+1. Connect ESP32 to your computer via USB-C to the ESP32's left USB port (as seen with the ports facing downward)
+2. Open the Arduino IDE app and Open the Enterprise_Homekit.ino sketch file 
+3. Click **Upload** (→ arrow) in Arduino IDE
+4. Wait for "Done uploading"
 
 ### 7. Configure WiFi
 
@@ -131,9 +154,6 @@ In Arduino IDE, configure:
 
 > Complete the software setup above first so you know your ESP32 is working and have noted the IP address before you assemble it into the base.
 
-### Overview
-
-![Base interior overview](images/base_interior.jpeg)
 
 ### Step 1 — Open the Base
 
@@ -250,6 +270,19 @@ http://<ESP32_IP>:8080
 ```
 
 The IP address is shown in Serial Monitor after WiFi connects. You can also find it in your router's device list — it appears as `HomeSpan-...` or `Espressif`.
+
+### Timing Tweaker
+
+Scroll to the bottom of the Web UI and you'll find a collapsible **Timing Tweaker** panel. This lets you fine-tune every delay used by the multi-tap sequences (single phaser, double-tap torpedoes, "Fire Everything" salvo, and the Anthem startup) without re-flashing the ESP32.
+
+![Timing Tweaker panel at the bottom of the Web UI](readme/Timing%20Tweaker.png)
+
+- All values are in **milliseconds, measured from the initial button tap**
+- Edits apply immediately so you can iterate live against the model
+- Press **Save** to persist the values to flash so they survive a reboot
+- If you ever want to return to the defaults, just clear the values or re-flash the sketch
+
+Use this if your particular Enterprise needs a slightly different cadence to keep the sounds locked to the on-model lighting effects.
 
 ---
 

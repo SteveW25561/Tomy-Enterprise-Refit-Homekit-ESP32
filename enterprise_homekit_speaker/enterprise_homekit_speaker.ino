@@ -1,18 +1,36 @@
 /*
  * ╔══════════════════════════════════════════════════════════════════════╗
- * ║  USS Enterprise NCC-1701 — Combined Controller                       ║
- * ║  HomeKit + Web Interface + Home Assistant (MQTT)                     ║
+ * ║  USS Enterprise NCC-1701 — Controller with I2S Speaker Output        ║
+ * ║  HomeKit + Web Interface + Home Assistant (MQTT) + MAX98357A audio   ║
  * ║  Tomy Enterprise Refit → ESP32-S3                                    ║
  * ╚══════════════════════════════════════════════════════════════════════╝
  *
- * WIRING
- * ──────
+ * TOUCH BUTTON WIRING
+ * ───────────────────
  *   GPIO 4 → 220Ω → PN2222 Base → Collector to Electrode A (Mode Select)
  *   GPIO 5 → 220Ω → PN2222 Base → Collector to Electrode B (Fire Control)
  *   Both PN2222 Emitters → GND (Pad G on sub-board)
  *
  *   Connect to COPPER ELECTRODE PLATE on back of each sub-board.
  *   GPIO HIGH = transistor ON = electrode to GND = touch registered.
+ *
+ * I2S AUDIO WIRING — MAX98357A
+ * ─────────────────────────────
+ *   ESP32 GPIO 6  →  MAX98357A BCLK
+ *   ESP32 GPIO 7  →  MAX98357A LRC
+ *   ESP32 GPIO 8  →  MAX98357A DIN
+ *   ESP32 3V3     →  MAX98357A Vin  (also tie SD to 3V3 — always enabled)
+ *   ESP32 3V3     →  MAX98357A SD
+ *   ESP32 GND     →  MAX98357A GND
+ *   MAX98357A +/− →  Speaker (4–8Ω, max 3W)
+ *   GAIN pin      →  leave floating (9dB default)
+ *
+ * AUDIO MODES (settable from Web UI, persisted in NVS)
+ * ─────────────────────────────────────────────────────
+ *   Browser mode: sounds play on the browser/phone running the Web UI
+ *                 (uses Web Audio API — sample-accurate on iOS/Chrome)
+ *   Speaker mode: sounds play through the I2S amp/speaker in the base
+ *                 Works with HomeKit and HA automations too (not just Web UI)
  *
  * INTERFACES
  * ──────────
@@ -25,9 +43,10 @@
  *   Power ON         momentary → tap A, 17s wait, 3× A (2s apart) → Warp
  *   Power OFF        momentary → hold A 5 s
  *   Power Mode       momentary → single press A
- *   Weapons          momentary → single press B
+ *   Weapons          momentary → single press B (plays phaser in speaker mode)
  *   Fire 2 Torpedoes momentary → double tap B, 0.5 s apart
  *   Fire Everything  momentary → triple tap B, 0.5 s apart (Battle Mode)
+ *   Anthem Startup   momentary → plays anthem + warp sequence (speaker mode)
  *
  * MQTT / HOME ASSISTANT
  * ──────────────────────
@@ -37,7 +56,7 @@
  * FIRST-TIME SETUP
  * ────────────────
  *   1. Set MQTT_BROKER below (or leave "" to skip)
- *   2. Upload sketch
+ *   2. Upload sketch (all 4 .h files must be in the same folder)
  *   3. Serial Monitor 115200 → type  W <SSID> <password>  → Enter
  *   4. Reboot — note IP address printed
  *   5. Home app → Add Accessory → More options → 836-17-294
@@ -46,6 +65,8 @@
  * LIBRARIES
  * ─────────
  *   HomeSpan 2.x, PubSubClient — Arduino Library Manager
+ *   ESP8266Audio — https://github.com/earlephilhower/ESP8266Audio
+ *     (install via Library Manager: search "ESP8266Audio")
  *   Board: ESP32S3 Dev Module, USB CDC on Boot: Enabled
  */
 
@@ -58,13 +79,77 @@
 
 // ── Includes ───────────────────────────────────────────────────────────────
 #include "HomeSpan.h"
+#include <Preferences.h>
 #include <WebServer.h>
 #include <WiFiClient.h>
 #include <PubSubClient.h>
+#include <AudioFileSourcePROGMEM.h>
+#include <AudioGeneratorMP3.h>
+#include <AudioOutputI2S.h>
+#include "anthem_mp3.h"   // Anthem startup music
+#include "torpedo_mp3.h"  // Torpedo launch sound (~841ms)
+#include "phaser_mp3.h"   // Phaser fire sound (~763ms)
 
 // ── Pins ───────────────────────────────────────────────────────────────────
-static constexpr int PIN_A = 4;
-static constexpr int PIN_B = 5;
+static constexpr int PIN_A    = 4;
+static constexpr int PIN_B    = 5;
+static constexpr int I2S_BCLK = 6;
+static constexpr int I2S_LRC  = 7;
+static constexpr int I2S_DIN  = 8;
+
+// ── Audio output mode ──────────────────────────────────────────────────────
+// AUDIO_BROWSER: sounds play in the browser/phone (Web Audio API)
+// AUDIO_SPEAKER: sounds play through the I2S amp/speaker in the base
+#define AUDIO_BROWSER 0
+#define AUDIO_SPEAKER 1
+volatile int   audioMode  = AUDIO_BROWSER;
+volatile float speakerVol = 0.25f;   // 0.0–1.0; start quiet so first power-on doesn't blast
+// MAX98357A is already at its 9 dB hardware gain. Anything above ~0.5 of full
+// software scale clips noticeably; keep this conservative.
+#define I2S_MAX_GAIN  0.5f
+
+// ── I2S audio task + scheduled sound queue ─────────────────────────────────
+// scheduleSnd() is non-blocking: it hands a request to the queue and returns.
+// audioTask() pulls requests off the queue, waits until their scheduled time,
+// then decodes & plays the MP3 through the MAX98357A.
+struct SoundReq { const uint8_t* data; size_t len; uint32_t schedMs; };
+#define SOUND_QUEUE_SIZE 20
+QueueHandle_t  soundQueue = nullptr;
+AudioOutputI2S* i2sOut    = nullptr;
+
+void scheduleSnd(const uint8_t* data, size_t len, uint32_t delayMs) {
+    if (audioMode != AUDIO_SPEAKER) return;
+    if (!soundQueue) return;
+    SoundReq r = { data, len, millis() + delayMs };
+    xQueueSend(soundQueue, &r, 0);
+}
+
+void audioTask(void*) {
+    i2sOut = new AudioOutputI2S();
+    i2sOut->SetPinout(I2S_BCLK, I2S_LRC, I2S_DIN);
+    i2sOut->SetGain(speakerVol * I2S_MAX_GAIN);
+
+    SoundReq req;
+    for (;;) {
+        if (xQueueReceive(soundQueue, &req, pdMS_TO_TICKS(5)) == pdTRUE) {
+            int32_t wait = (int32_t)(req.schedMs - millis());
+            if (wait > 0) vTaskDelay(pdMS_TO_TICKS(wait));
+
+            // Re-apply gain on every play so volume-slider changes take effect
+            // immediately — without this the SetGain() above only runs once.
+            i2sOut->SetGain(speakerVol * I2S_MAX_GAIN);
+
+            AudioFileSourcePROGMEM src(req.data, req.len);
+            AudioGeneratorMP3 mp3;
+            mp3.begin(&src, i2sOut);
+            while (mp3.isRunning()) {
+                if (!mp3.loop()) { mp3.stop(); break; }
+                vTaskDelay(1);
+            }
+        }
+        vTaskDelay(1);
+    }
+}
 
 // ── Timing ─────────────────────────────────────────────────────────────────
 static constexpr int PRESS_MS        =  200;   // Single press duration (HIGH)
@@ -73,6 +158,31 @@ static constexpr int STARTUP_WAIT_MS = 17000;  // Wait after tap 1 for animation
 static constexpr int WARP_GAP_MS     =  2000;  // Between mode-cycle presses
 static constexpr int TORPEDO_GAP_MS  =   500;  // Between torpedo presses
 static constexpr int POWEROFF_MS     =  5000;  // Hold A for power-down
+
+// ── Anthem Startup timing (tweak independently from Power ON) ──────────────
+// Adjust these to sync button presses with the music
+static constexpr int ANTHEM_STARTUP_WAIT_MS = 17000;  // Wait after tap 1 (startup animation)
+static constexpr int ANTHEM_WARP_GAP_MS     =  2000;  // Gap between presses 2 and 3
+static constexpr int ANTHEM_LAST_GAP_MS     =  2000;  // Gap before final (4th) press — tweak to hit music cue
+
+// ── Sound timing offsets (ms after button press) ──────────────────────────
+// These control when audio plays relative to when the visual effect appears.
+// Positive = audio plays AFTER button press, negative is not possible in JS
+// (browser plays immediately on button tap; these delay the SECOND sound etc.)
+//
+// Button B (single press) — phaser alternates
+static constexpr int SND_PHASER_DELAY_MS      =    0;  // ms after tap before phaser sound starts
+
+// Fire 2 Torpedoes — double tap B, 0.5s apart
+static constexpr int SND_TORP1_DELAY_MS       =    0;  // ms after tap 1 before torpedo 1 sound
+static constexpr int SND_TORP2_DELAY_MS       =  500;  // ms after tap 1 before torpedo 2 sound (matches TORPEDO_GAP_MS)
+
+// Fire Everything — triple tap B
+// Sequence: tap1 → tap2 (0.5s) → tap3 (0.5s)
+// Visuals: torpedo pulses, then phaser banks on saucer illuminate
+static constexpr int SND_ALL_TORP1_DELAY_MS   =    0;  // torpedo 1
+static constexpr int SND_ALL_TORP2_DELAY_MS   =  500;  // torpedo 2
+static constexpr int SND_ALL_PHASER_DELAY_MS  = 1200;  // phasers engage after torpedoes
 
 // ── MQTT ───────────────────────────────────────────────────────────────────
 WiFiClient   wifiClient;
@@ -84,9 +194,90 @@ PubSubClient mqtt(wifiClient);
 #define T_PRESS_B_CMD   "enterprise/press_b/set"
 #define T_FIRE2_CMD     "enterprise/fire2/set"
 #define T_FIRE3_CMD     "enterprise/fire3/set"
+#define T_ANTHEM_CMD    "enterprise/anthem/set"
 
 // ── Web UI (runs on Core 0 via FreeRTOS task) ──────────────────────────────
 WebServer webUI(8080);
+Preferences prefs;
+
+// ── Runtime timing values (loaded from NVS, overridable via Web UI) ────────
+struct Timing {
+    // Button B
+    int phaser_delay      =  1900;
+    // Fire 2
+    int f2_torp1          =  2900;
+    int f2_torp2          =  3200;
+    // Fire Everything
+    int fe_p1             =  3000;
+    int fe_t1             =  4700;
+    int fe_t2             =  5100;
+    int fe_p2             =  5800;
+    int fe_p3             =  8700;
+    int fe_t3             =  9900;
+    int fe_t4             = 10700;
+    int fe_p4             = 11100;
+    // Anthem
+    int anthem_wait       = 17000;
+    int anthem_gap        =  2000;
+    int anthem_last_gap   =  2000;
+} T;
+
+void loadTimings() {
+    prefs.begin("timing", true);  // read-only
+    T.phaser_delay    = prefs.getInt("phaser_delay",    T.phaser_delay);
+    T.f2_torp1        = prefs.getInt("f2_torp1",        T.f2_torp1);
+    T.f2_torp2        = prefs.getInt("f2_torp2",        T.f2_torp2);
+    T.fe_p1           = prefs.getInt("fe_p1",           T.fe_p1);
+    T.fe_t1           = prefs.getInt("fe_t1",           T.fe_t1);
+    T.fe_t2           = prefs.getInt("fe_t2",           T.fe_t2);
+    T.fe_p2           = prefs.getInt("fe_p2",           T.fe_p2);
+    T.fe_p3           = prefs.getInt("fe_p3",           T.fe_p3);
+    T.fe_t3           = prefs.getInt("fe_t3",           T.fe_t3);
+    T.fe_t4           = prefs.getInt("fe_t4",           T.fe_t4);
+    T.fe_p4           = prefs.getInt("fe_p4",           T.fe_p4);
+    T.anthem_wait     = prefs.getInt("anthem_wait",     T.anthem_wait);
+    T.anthem_gap      = prefs.getInt("anthem_gap",      T.anthem_gap);
+    T.anthem_last_gap = prefs.getInt("anthem_last_gap", T.anthem_last_gap);
+    audioMode         = prefs.getInt  ("audio_mode",   AUDIO_BROWSER);
+    speakerVol        = prefs.getFloat("speaker_vol",  0.25f);
+    prefs.end();
+    Serial.println("Settings loaded from NVS");
+}
+
+void saveAudioSettings() {
+    prefs.begin("timing", false);
+    prefs.putInt  ("audio_mode",  audioMode);
+    prefs.putFloat("speaker_vol", speakerVol);
+    prefs.end();
+}
+
+void saveTimings() {
+    prefs.begin("timing", false);  // read-write
+    prefs.putInt("phaser_delay",    T.phaser_delay);
+    prefs.putInt("f2_torp1",        T.f2_torp1);
+    prefs.putInt("f2_torp2",        T.f2_torp2);
+    prefs.putInt("fe_p1",           T.fe_p1);
+    prefs.putInt("fe_t1",           T.fe_t1);
+    prefs.putInt("fe_t2",           T.fe_t2);
+    prefs.putInt("fe_p2",           T.fe_p2);
+    prefs.putInt("fe_p3",           T.fe_p3);
+    prefs.putInt("fe_t3",           T.fe_t3);
+    prefs.putInt("fe_t4",           T.fe_t4);
+    prefs.putInt("fe_p4",           T.fe_p4);
+    prefs.putInt("anthem_wait",     T.anthem_wait);
+    prefs.putInt("anthem_gap",      T.anthem_gap);
+    prefs.putInt("anthem_last_gap", T.anthem_last_gap);
+    prefs.end();
+    Serial.println("Timings saved to NVS");
+}
+
+void resetTimings() {
+    prefs.begin("timing", false);
+    prefs.clear();
+    prefs.end();
+    T = Timing();  // reset to defaults
+    Serial.println("Timings reset to defaults");
+}
 
 // ── Press primitives ───────────────────────────────────────────────────────
 
@@ -125,10 +316,48 @@ void actPowerOff() {
     simHold(PIN_A, POWEROFF_MS);
 }
 
+void actAnthemStartup() {
+    LOG1("Action: Anthem Startup → Warp Speed\n");
+    scheduleSnd(ANTHEM_MP3, ANTHEM_MP3_LEN, 0);   // plays through I2S in speaker mode
+    // Same button sequence as Power ON to Warp — tweak ANTHEM_ constants to sync with music
+    simPress(PIN_A);                              // Tap 1 — lights on
+    delay(T.anthem_wait);                         // Wait for startup animation
+    simPress(PIN_A); delay(T.anthem_gap);         // Tap 2 → Underway
+    simPress(PIN_A); delay(T.anthem_last_gap);    // Tap 3 → Impulse/Full Power
+    simPress(PIN_A);                              // Tap 4 → Warp Speed
+}
+
 void actPressA()  { LOG1("Action: Press A\n");            simPress(PIN_A); }
-void actPressB()  { LOG1("Action: Press B\n");            simPress(PIN_B); }
-void actFire2()   { LOG1("Action: Fire 2 torpedoes\n");   simMulti(PIN_B, 2, TORPEDO_GAP_MS); }
-void actFire3()   { LOG1("Action: Fire everything\n");    simMulti(PIN_B, 3, TORPEDO_GAP_MS); }
+
+void actPressB() {
+    LOG1("Action: Press B\n");
+    scheduleSnd(PHASER_MP3, PHASER_MP3_LEN, T.phaser_delay);
+    simPress(PIN_B);
+}
+
+void actFire2() {
+    LOG1("Action: Fire 2 torpedoes\n");
+    scheduleSnd(TORPEDO_MP3, TORPEDO_MP3_LEN, T.f2_torp1);
+    scheduleSnd(TORPEDO_MP3, TORPEDO_MP3_LEN, T.f2_torp2);
+    simMulti(PIN_B, 2, TORPEDO_GAP_MS);
+}
+
+void actFire3() {
+    LOG1("Action: Fire everything\n");
+    // P → T → T → P → P → T → (T + P) — phaser banks 4+5 visually fire together,
+    // so we only schedule one phaser sound for that beat (the I2S audio task
+    // plays sounds sequentially, so a second overlapping phaser would just
+    // play back-to-back instead of doubling up).
+    scheduleSnd(PHASER_MP3,  PHASER_MP3_LEN,  T.fe_p1);
+    scheduleSnd(TORPEDO_MP3, TORPEDO_MP3_LEN, T.fe_t1);
+    scheduleSnd(TORPEDO_MP3, TORPEDO_MP3_LEN, T.fe_t2);
+    scheduleSnd(PHASER_MP3,  PHASER_MP3_LEN,  T.fe_p2);
+    scheduleSnd(PHASER_MP3,  PHASER_MP3_LEN,  T.fe_p3);
+    scheduleSnd(TORPEDO_MP3, TORPEDO_MP3_LEN, T.fe_t3);
+    scheduleSnd(TORPEDO_MP3, TORPEDO_MP3_LEN, T.fe_t4);
+    scheduleSnd(PHASER_MP3,  PHASER_MP3_LEN,  T.fe_p4);
+    simMulti(PIN_B, 3, TORPEDO_GAP_MS);
+}
 
 // ── MQTT ───────────────────────────────────────────────────────────────────
 
@@ -155,6 +384,7 @@ void mqttPublishDiscovery() {
     btn("enterprise_press_b",   "Weapons (Press B)",     T_PRESS_B_CMD);
     btn("enterprise_fire2",     "Fire 2 Torpedoes",      T_FIRE2_CMD);
     btn("enterprise_fire3",     "Fire Everything",       T_FIRE3_CMD);
+    btn("enterprise_anthem",    "Anthem Startup",        T_ANTHEM_CMD);
 
     Serial.println("MQTT: HA discovery published");
 }
@@ -168,6 +398,7 @@ void mqttCallback(char* topic, byte* payload, unsigned int len) {
     else if (t == T_PRESS_B_CMD)   actPressB();
     else if (t == T_FIRE2_CMD)     actFire2();
     else if (t == T_FIRE3_CMD)     actFire3();
+    else if (t == T_ANTHEM_CMD)    actAnthemStartup();
 }
 
 void mqttReconnect() {
@@ -185,6 +416,7 @@ void mqttReconnect() {
         mqtt.subscribe(T_PRESS_B_CMD);
         mqtt.subscribe(T_FIRE2_CMD);
         mqtt.subscribe(T_FIRE3_CMD);
+        mqtt.subscribe(T_ANTHEM_CMD);
         mqttPublishDiscovery();
     } else {
         Serial.printf(" failed (rc=%d)\n", mqtt.state());
@@ -260,7 +492,20 @@ button:active{opacity:.6}
 .b  {background:rgba(80,50,0,0.9);color:#ffcc44;border:1px solid #7c5a00}
 .off{background:rgba(80,0,16,0.9);color:#ff7788;border:1px solid #880020}
 .seq{background:rgba(20,20,80,0.9);color:#99aaff;border:1px solid #2a2a8c}
+.anthem{background:rgba(60,20,80,0.9);color:#ddaaff;border:1px solid #7a4a9a}
 .row{display:flex;gap:7px}.row button{flex:1;margin:0}
+.tgroup{font-size:11px;color:#88aacc;margin:10px 0 4px;font-weight:600}
+.trow{display:flex;align-items:center;justify-content:space-between;margin:3px 0}
+.trow label{font-size:12px;color:#889;flex:1}
+.trow input{width:80px;background:#0d0d20;border:1px solid #334;border-radius:5px;
+            color:#aaddff;font-size:13px;padding:4px 6px;text-align:right}
+.srow{display:flex;align-items:center;gap:10px;margin:6px 0}
+.srow label{font-size:12px;color:#889;min-width:120px}
+.srow input[type=range]{flex:1;accent-color:#88aacc}
+.srow span{font-size:12px;color:#aaddff;min-width:36px;text-align:right}
+.mode-btn{flex:1;padding:10px;font-size:13px;border:1px solid #334;border-radius:8px;
+          background:#0d0d20;color:#889;cursor:pointer;transition:all .2s}
+.mode-btn.active{background:rgba(20,60,100,0.9);color:#88ccff;border-color:#336699}
 #st{text-align:center;min-height:26px;padding:5px;border-radius:7px;
     font-size:13px;margin:7px 0;position:relative;z-index:1}
 #st.ok  {background:rgba(10,42,18,0.9);color:#44dd88}
@@ -286,7 +531,7 @@ button:active{opacity:.6}
   <h3>Single Presses</h3>
   <div class="row">
     <button class="a" onclick="go('/pa','Press A',400)">Press A</button>
-    <button class="b" onclick="go('/pb','Press B',400)">Press B</button>
+    <button class="b" onclick="pressBSound()">Press B</button>
   </div>
 </div>
 
@@ -299,10 +544,16 @@ button:active{opacity:.6}
   <button class="seq" onclick="go('/power_on','Power ON → Warp Speed (~25 s)',25000)">
     ⚡ Power ON → Warp Speed
   </button>
+  <button class="anthem" onclick="anthemStart()">
+    🎵 Anthem Startup → Warp Speed
+  </button>
   <button class="off" onclick="go('/power_off','Power OFF — hold A 5 s',5500)">
     ■ Power OFF
   </button>
 </div>
+<!-- Sounds are loaded and played through the Web Audio API (see script
+     below). HTML5 <audio> elements are unreliable on iOS for overlapping /
+     scheduled playback. -->
 
 <div class="card">
   <h3>Weapons</h3>
@@ -310,8 +561,24 @@ button:active{opacity:.6}
     <b>Fire 2:</b> Double tap B, 0.5s apart<br>
     <b>Fire Everything:</b> Triple tap B — Battle Mode
   </div>
-  <button class="b" onclick="go('/fire2','Fire 2 Torpedoes',1500)">◎◎ Fire 2 Torpedoes</button>
-  <button class="b" onclick="go('/fire3','Fire Everything — Battle Mode',2000)">◎◎◎ Fire Everything</button>
+  <button class="b" onclick="fire2Sound()">◎◎ Fire 2 Torpedoes</button>
+  <button class="b" onclick="fireAllSound()">◎◎◎ Fire Everything</button>
+</div>
+
+<div class="card">
+  <h3>🔊 Audio Settings</h3>
+  <div class="tgroup">Output mode</div>
+  <div class="row" style="margin-bottom:10px">
+    <button class="mode-btn" id="btn-browser" onclick="setMode(0)">🌐 Browser</button>
+    <button class="mode-btn" id="btn-speaker" onclick="setMode(1)">🔊 Speaker</button>
+  </div>
+  <div class="srow">
+    <label>Speaker volume</label>
+    <input type="range" id="vol-slider" min="0" max="100" value="25"
+           oninput="volChange(this.value)">
+    <span id="vol-label">25%</span>
+  </div>
+  <div class="note" id="mode-note" style="margin-top:6px"></div>
 </div>
 
 <script>
@@ -322,12 +589,222 @@ function log(m){logs.push(new Date().toLocaleTimeString()+' '+m);
 function st(m,c){var e=document.getElementById('st');e.textContent=m;e.className=c||'';}
 function pulse(ms){var b=document.getElementById('bar');
   b.style.width='100%';setTimeout(function(){b.style.width='0%';},ms);}
+// ─── Audio playback (Web Audio API) ────────────────────────────────────────
+// iOS Safari severely restricts HTML5 <audio>: only the first few elements
+// touched inside a user gesture are unlocked, and setTimeout-delayed play()
+// calls drift / are dropped. The Web Audio API lets us unlock once (per
+// AudioContext), keep MP3s decoded in memory, schedule playback with
+// sample-accurate timing, and overlap as many sources as we want.
+//
+// curMode mirrors the ESP32's audioMode: 0=browser, 1=speaker. In speaker
+// mode the ESP32 plays sounds through I2S, so we skip browser playback.
+var audioCtx = null;
+var audioBuffers = {};   // name -> decoded AudioBuffer
+var audioRaw     = {};   // name -> ArrayBuffer waiting to be decoded
+var SOUND_NAMES  = ['phaser', 'torpedo', 'anthem'];
+var curMode      = 0;    // populated by loadTimings()
+
+// Pre-fetch raw bytes immediately on page load (no AudioContext required).
+SOUND_NAMES.forEach(function(name) {
+  fetch('/' + name + '.mp3')
+    .then(function(r){ return r.arrayBuffer(); })
+    .then(function(b){ audioRaw[name] = b; })
+    .catch(function(e){ log('Load ' + name + ': ' + e.message); });
+});
+
+// Must be called from a user gesture (click) to unlock audio on iOS.
+function ensureAudio() {
+  if (!audioCtx) {
+    var Ctx = window.AudioContext || window.webkitAudioContext;
+    if (!Ctx) return false;
+    audioCtx = new Ctx();
+  }
+  if (audioCtx.state === 'suspended') audioCtx.resume();
+  // Decode anything we've fetched but not yet decoded.
+  SOUND_NAMES.forEach(function(name) {
+    if (audioBuffers[name] || !audioRaw[name]) return;
+    var raw = audioRaw[name];
+    audioRaw[name] = null;
+    audioCtx.decodeAudioData(raw)
+      .then(function(d){ audioBuffers[name] = d; })
+      .catch(function(e){ log('Decode ' + name + ': ' + e.message); });
+  });
+  return true;
+}
+
+// Play a sound after an optional delay (ms). The id may include a numeric
+// suffix (e.g. 'phaser2', 'torpedo3') left over from the old per-element
+// scheme — we map it back to the underlying sound name.
+function playAt(id, delayMs) {
+  if (curMode !== 0) return;   // speaker mode: ESP32 handles audio
+  if (!ensureAudio()) return;
+  var key = id.replace(/\d+$/, '');
+  var when = audioCtx.currentTime + (delayMs || 0) / 1000;
+  var fire = function() {
+    var buf = audioBuffers[key];
+    if (!buf) return false;
+    var src = audioCtx.createBufferSource();
+    src.buffer = buf;
+    src.connect(audioCtx.destination);
+    src.start(Math.max(when, audioCtx.currentTime));
+    return true;
+  };
+  if (fire()) return;
+  // Buffer not yet decoded — poll briefly, then give up.
+  var tries = 0;
+  var poll = setInterval(function() {
+    if (fire() || ++tries > 100) clearInterval(poll);
+  }, 30);
+}
+
+function setMode(m) {
+  curMode = m;
+  updateModeUI(m);
+  fetch('/save_audio', {method:'POST', headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({mode:m, vol:parseInt(document.getElementById('vol-slider').value)})
+  }).then(function(){ log('Audio mode: ' + (m===0?'browser':'speaker')); });
+}
+
+function updateModeUI(m) {
+  document.getElementById('btn-browser').classList.toggle('active', m===0);
+  document.getElementById('btn-speaker').classList.toggle('active', m===1);
+  document.getElementById('mode-note').textContent = m===0
+    ? 'Audio plays on this browser/device.'
+    : 'Audio plays on the speaker inside the Enterprise base. Works with HomeKit & HA too.';
+}
+
+function volChange(v) {
+  document.getElementById('vol-label').textContent = v + '%';
+  fetch('/save_audio', {method:'POST', headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({mode:curMode, vol:parseInt(v)})}).then(function(){});
+}
+
+// Timing values — defaults shown; overwritten by loadTimings() from ESP32 NVS
+var T = {
+  phaser_delay:1900,
+  f2_torp1:2900,  f2_torp2:3200,
+  fe_p1:3000,     fe_t1:4700,   fe_t2:5100,
+  fe_p2:5800,     fe_p3:8700,
+  fe_t3:9900,     fe_t4:10700,  fe_p4:11100,
+  anthem_wait:17000, anthem_gap:2000, anthem_last_gap:2000
+};
+
+function loadTimings() {
+  fetch('/timing').then(function(r){return r.json();}).then(function(d){
+    // Separate audio fields from timing fields before overwriting T
+    if (typeof d.audio_mode === 'number')  { curMode = d.audio_mode;  delete d.audio_mode; }
+    var vol = typeof d.speaker_vol === 'number' ? d.speaker_vol : null;
+    if (vol !== null) delete d.speaker_vol;
+    T = d;
+    Object.keys(T).forEach(function(k){
+      var el = document.getElementById('t_'+k);
+      if (el) el.value = T[k];
+    });
+    updateModeUI(curMode);
+    if (vol !== null) {
+      var pct = Math.round(vol * 100);
+      document.getElementById('vol-slider').value = pct;
+      document.getElementById('vol-label').textContent = pct + '%';
+    }
+  }).catch(function(){
+    // If fetch fails (e.g. page loaded before WiFi), populate with defaults
+    Object.keys(T).forEach(function(k){
+      var el = document.getElementById('t_'+k);
+      if (el) el.value = T[k];
+    });
+    updateModeUI(curMode);
+  });
+}
+
+function pressBSound() {
+  playAt('phaser', T.phaser_delay);   // single phaser bank
+  go('/pb', 'Press B (Weapons)', 400);
+}
+function fire2Sound() {
+  playAt('torpedo',  T.f2_torp1);   // torpedo 1
+  playAt('torpedo2', T.f2_torp2);   // torpedo 2 (independent, can overlap)
+  go('/fire2', 'Fire 2 Torpedoes', 1500);
+}
+function fireAllSound() {
+  // P → T → T → P → P → T → (T + P) — phaser banks 4+5 fire visually together,
+  // so we only play one phaser sound at the final beat.
+  playAt('phaser',   T.fe_p1);   // [1] Phaser — single bank
+  playAt('torpedo',  T.fe_t1);   // [2] Torpedo 1
+  playAt('torpedo2', T.fe_t2);   // [3] Torpedo 2
+  playAt('phaser2',  T.fe_p2);   // [4] Phaser bank 1
+  playAt('phaser3',  T.fe_p3);   // [5] Phaser bank 2
+  playAt('torpedo3', T.fe_t3);   // [6] Torpedo 3
+  playAt('torpedo4', T.fe_t4);   // [7] Torpedo 4   ─┐ simultaneous
+  playAt('phaser4',  T.fe_p4);   // [8] Phasers 4   ─┘
+  go('/fire3', 'Fire Everything — Battle Mode', 3000);
+}
+function anthemStart() {
+  playAt('anthem', 0);
+  go('/anthem_on', 'Anthem Startup (~25 s)', T.anthem_wait + 7000);
+}
 function go(p,l,dur){st('⏳ '+l,'busy');log('→ '+l);pulse(dur||500);
   fetch(p).then(function(r){return r.text();}).then(function(t){
     st('✓ '+t,'ok');log('✓ '+t);
     setTimeout(function(){st('','');},5000);
   }).catch(function(){st('✗ Failed','err');log('✗ Failed');});}
+
+function tpanel(){
+  var p=document.getElementById('tpanel');
+  p.style.display=p.style.display==='none'?'block':'none';}
+
+function tchange(k,v){
+  T[k]=parseInt(v)||0;}
+
+function tsave(){
+  fetch('/save_timing',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify(T)}).then(function(r){return r.text();}).then(function(t){
+    st('✓ Timings saved','ok');log('✓ Timings saved to device');
+    setTimeout(function(){st('','');},3000);
+  }).catch(function(){st('✗ Save failed','err');});}
+
+function treset(){
+  if(!confirm('Reset all timings to defaults?'))return;
+  fetch('/reset_timing').then(function(){loadTimings();
+    st('✓ Reset to defaults','ok');setTimeout(function(){st('','');},3000);});}
+
+loadTimings();
 </script>
+
+<div class="card" style="margin-top:10px">
+  <h3 onclick="tpanel()" style="cursor:pointer;user-select:none">
+    ⚙ Timing Tweaker <span style="float:right;color:#446">▼ tap to expand</span>
+  </h3>
+  <div id="tpanel" style="display:none">
+    <div class="note" style="margin-bottom:10px">All values in milliseconds from button tap. Changes apply immediately. Press Save to persist across reboots.</div>
+
+    <div class="tgroup"><b>Button B — single phaser</b></div>
+    <div class="trow"><label>Phaser delay</label><input type="number" id="t_phaser_delay" oninput="tchange('phaser_delay',this.value)"></div>
+
+    <div class="tgroup"><b>Fire 2 Torpedoes</b></div>
+    <div class="trow"><label>Torpedo 1</label><input type="number" id="t_f2_torp1" oninput="tchange('f2_torp1',this.value)"></div>
+    <div class="trow"><label>Torpedo 2</label><input type="number" id="t_f2_torp2" oninput="tchange('f2_torp2',this.value)"></div>
+
+    <div class="tgroup"><b>Fire Everything — P→T→T→P→P→T→(T+P)</b></div>
+    <div class="trow"><label>[1] Phaser 1</label><input type="number" id="t_fe_p1" oninput="tchange('fe_p1',this.value)"></div>
+    <div class="trow"><label>[2] Torpedo 1</label><input type="number" id="t_fe_t1" oninput="tchange('fe_t1',this.value)"></div>
+    <div class="trow"><label>[3] Torpedo 2</label><input type="number" id="t_fe_t2" oninput="tchange('fe_t2',this.value)"></div>
+    <div class="trow"><label>[4] Phaser 2</label><input type="number" id="t_fe_p2" oninput="tchange('fe_p2',this.value)"></div>
+    <div class="trow"><label>[5] Phaser 3</label><input type="number" id="t_fe_p3" oninput="tchange('fe_p3',this.value)"></div>
+    <div class="trow"><label>[6] Torpedo 3</label><input type="number" id="t_fe_t3" oninput="tchange('fe_t3',this.value)"></div>
+    <div class="trow"><label>[7] Torpedo 4</label><input type="number" id="t_fe_t4" oninput="tchange('fe_t4',this.value)"></div>
+    <div class="trow"><label>[8] Phasers 4</label><input type="number" id="t_fe_p4" oninput="tchange('fe_p4',this.value)"></div>
+
+    <div class="tgroup"><b>Anthem Startup</b></div>
+    <div class="trow"><label>Wait after tap 1 (ms)</label><input type="number" id="t_anthem_wait" oninput="tchange('anthem_wait',this.value)"></div>
+    <div class="trow"><label>Gap tap 2→3 (ms)</label><input type="number" id="t_anthem_gap" oninput="tchange('anthem_gap',this.value)"></div>
+    <div class="trow"><label>Gap tap 3→4 (ms)</label><input type="number" id="t_anthem_last_gap" oninput="tchange('anthem_last_gap',this.value)"></div>
+
+    <div style="display:flex;gap:8px;margin-top:10px">
+      <button class="seq" style="font-size:13px;padding:10px" onclick="tsave()">💾 Save to device</button>
+      <button class="off" style="font-size:13px;padding:10px;flex:0 0 auto;width:auto" onclick="treset()">↺ Reset defaults</button>
+    </div>
+  </div>
+</div>
 </body></html>
 )rawhtml";
 
@@ -335,6 +812,112 @@ function go(p,l,dur){st('⏳ '+l,'busy');log('→ '+l);pulse(dur||500);
 void webTask(void*) {
     webUI.on("/", [](){
         webUI.send_P(200, "text/html", HTML);
+    });
+    webUI.on("/anthem.mp3", [](){
+        webUI.sendHeader("Content-Type", "audio/mpeg");
+        webUI.sendHeader("Cache-Control", "public, max-age=86400");
+        webUI.send_P(200, "audio/mpeg", (const char*)ANTHEM_MP3, ANTHEM_MP3_LEN);
+    });
+    webUI.on("/torpedo.mp3", [](){
+        webUI.sendHeader("Content-Type", "audio/mpeg");
+        webUI.sendHeader("Cache-Control", "public, max-age=86400");
+        webUI.send_P(200, "audio/mpeg", (const char*)TORPEDO_MP3, TORPEDO_MP3_LEN);
+    });
+    webUI.on("/phaser.mp3", [](){
+        webUI.sendHeader("Content-Type", "audio/mpeg");
+        webUI.sendHeader("Cache-Control", "public, max-age=86400");
+        webUI.send_P(200, "audio/mpeg", (const char*)PHASER_MP3, PHASER_MP3_LEN);
+    });
+    webUI.on("/anthem_on", [](){ webUI.send(200,"text/plain","Anthem startup running..."); actAnthemStartup(); });
+
+    // Timing API
+    webUI.on("/timing", [](){
+        String j = "{";
+        j += "\"phaser_delay\":"    + String(T.phaser_delay)    + ",";
+        j += "\"f2_torp1\":"        + String(T.f2_torp1)        + ",";
+        j += "\"f2_torp2\":"        + String(T.f2_torp2)        + ",";
+        j += "\"fe_p1\":"           + String(T.fe_p1)           + ",";
+        j += "\"fe_t1\":"           + String(T.fe_t1)           + ",";
+        j += "\"fe_t2\":"           + String(T.fe_t2)           + ",";
+        j += "\"fe_p2\":"           + String(T.fe_p2)           + ",";
+        j += "\"fe_p3\":"           + String(T.fe_p3)           + ",";
+        j += "\"fe_t3\":"           + String(T.fe_t3)           + ",";
+        j += "\"fe_t4\":"           + String(T.fe_t4)           + ",";
+        j += "\"fe_p4\":"           + String(T.fe_p4)           + ",";
+        j += "\"anthem_wait\":"     + String(T.anthem_wait)     + ",";
+        j += "\"anthem_gap\":"      + String(T.anthem_gap)      + ",";
+        j += "\"anthem_last_gap\":" + String(T.anthem_last_gap) + ",";
+        j += "\"audio_mode\":"      + String(audioMode)         + ",";
+        j += "\"speaker_vol\":"     + String(speakerVol, 3);
+        j += "}";
+        webUI.send(200, "application/json", j);
+    });
+
+    // Save audio mode + volume (separate POST so the timing-tweaker save
+    // doesn't need to know about them).
+    webUI.on("/save_audio", HTTP_POST, [](){
+        if (!webUI.hasArg("plain")) { webUI.send(400, "text/plain", "No body"); return; }
+        String body = webUI.arg("plain");
+        auto getVal = [&](const char* key) -> int {
+            String k = "\"" + String(key) + "\":";
+            int idx = body.indexOf(k);
+            if (idx < 0) return -1;
+            idx += k.length();
+            int end1 = body.indexOf(',', idx);
+            int end2 = body.indexOf('}', idx);
+            int end  = end1 < 0 ? end2 : (end2 < 0 ? end1 : min(end1, end2));
+            return body.substring(idx, end).toInt();
+        };
+        int m = getVal("mode");
+        if (m == AUDIO_BROWSER || m == AUDIO_SPEAKER) audioMode = m;
+        int v = getVal("vol");   // 0–100 from slider
+        if (v >= 0 && v <= 100) speakerVol = v / 100.0f;
+        // Re-apply gain immediately so the next sound reflects the new volume
+        // (audioTask also re-applies before each play, but this gives instant
+        // feedback if a sound is currently mid-flight).
+        if (i2sOut) i2sOut->SetGain(speakerVol * I2S_MAX_GAIN);
+        saveAudioSettings();
+        webUI.send(200, "text/plain", "Audio settings saved");
+    });
+    webUI.on("/save_timing", HTTP_POST, [](){
+        if (webUI.hasArg("plain")) {
+            String body = webUI.arg("plain");
+            // Parse simple key=value pairs sent as JSON
+            auto getVal = [&](const char* key) -> int {
+                String k = "\"" + String(key) + "\":";
+                int idx = body.indexOf(k);
+                if (idx < 0) return -1;
+                idx += k.length();
+                return body.substring(idx, body.indexOf(',', idx) == -1 ?
+                    body.indexOf('}', idx) : min(body.indexOf(',', idx), body.indexOf('}', idx))).toInt();
+            };
+            auto applyVal = [&](const char* key, int& field) {
+                int v = getVal(key);
+                if (v >= 0) field = v;
+            };
+            applyVal("phaser_delay",    T.phaser_delay);
+            applyVal("f2_torp1",        T.f2_torp1);
+            applyVal("f2_torp2",        T.f2_torp2);
+            applyVal("fe_p1",           T.fe_p1);
+            applyVal("fe_t1",           T.fe_t1);
+            applyVal("fe_t2",           T.fe_t2);
+            applyVal("fe_p2",           T.fe_p2);
+            applyVal("fe_p3",           T.fe_p3);
+            applyVal("fe_t3",           T.fe_t3);
+            applyVal("fe_t4",           T.fe_t4);
+            applyVal("fe_p4",           T.fe_p4);
+            applyVal("anthem_wait",     T.anthem_wait);
+            applyVal("anthem_gap",      T.anthem_gap);
+            applyVal("anthem_last_gap", T.anthem_last_gap);
+            saveTimings();
+            webUI.send(200, "text/plain", "Saved");
+        } else {
+            webUI.send(400, "text/plain", "No body");
+        }
+    });
+    webUI.on("/reset_timing", [](){
+        resetTimings();
+        webUI.send(200, "text/plain", "Reset to defaults");
     });
     webUI.on("/pa",        [](){ actPressA();  webUI.send(200,"text/plain","A pressed"); });
     webUI.on("/pb",        [](){ actPressB();  webUI.send(200,"text/plain","B pressed"); });
@@ -355,16 +938,25 @@ void setup() {
     // Set pins LOW FIRST — prevents touch IC seeing boot transients
     pinMode(PIN_A, OUTPUT); digitalWrite(PIN_A, LOW);
     pinMode(PIN_B, OUTPUT); digitalWrite(PIN_B, LOW);
-    delay(1000);  // Let Enterprise touch IC settle with clean baseline
+    delay(1000);
+
+    loadTimings();  // Load saved timing + audio settings from NVS
 
     Serial.begin(115200);
     delay(200);
 
+    // I2S audio task — created before HomeSpan so the first action (e.g. an
+    // Anthem trigger right after reboot) finds the queue ready.
+    soundQueue = xQueueCreate(SOUND_QUEUE_SIZE, sizeof(SoundReq));
+    xTaskCreatePinnedToCore(audioTask, "Audio", 8192, NULL, 2, NULL, 1);
+
     Serial.println("\n╔════════════════════════════════════════════════╗");
-    Serial.println(  "║      USS Enterprise NCC-1701 Controller        ║");
+    Serial.println(  "║   USS Enterprise NCC-1701 — Speaker Edition    ║");
     Serial.println(  "╠════════════════════════════════════════════════╣");
     Serial.println(  "║  HomeKit  →  836-17-294                         ║");
     Serial.println(  "║  Web UI   →  http://<IP>:8080 (shown on connect)║");
+    Serial.printf(   "║  Audio    →  %-34s║\n",
+                     audioMode == AUDIO_SPEAKER ? "SPEAKER (I2S)" : "BROWSER");
     if (mqttEnabled()) {
         Serial.printf("║  MQTT     →  %-34s║\n", MQTT_BROKER);
     } else {
@@ -446,9 +1038,20 @@ void setup() {
             new Characteristic::Manufacturer("Tomy");
             new Characteristic::SerialNumber("NCC-1701-F3");
             new Characteristic::Model("Enterprise Refit");
-            new Characteristic::FirmwareRevision("2.0");
+            new Characteristic::FirmwareRevision("3.0");
             new Characteristic::Identify();
         new MomentarySwitch(actFire3);
+
+    // Anthem Startup — plays anthem MP3 (in speaker mode) plus the warp sequence
+    new SpanAccessory();
+        new Service::AccessoryInformation();
+            new Characteristic::Name("Anthem Startup");
+            new Characteristic::Manufacturer("Tomy");
+            new Characteristic::SerialNumber("NCC-1701-ANTHEM");
+            new Characteristic::Model("Enterprise Refit");
+            new Characteristic::FirmwareRevision("3.0");
+            new Characteristic::Identify();
+        new MomentarySwitch(actAnthemStartup);
 
     // Start web UI on Core 0 (HomeSpan/loop runs on Core 1)
     // Wait for WiFi first (HomeSpan connects WiFi during poll)
