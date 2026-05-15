@@ -130,20 +130,20 @@ void scheduleSnd(const uint8_t* data, size_t len, uint32_t delayMs) {
     if (q) xQueueSend(q, &r, 0);
 }
 
-// Buffers all samples produced by one mp3.loop() call (up to one decoded frame).
-// Returning false only when full lets the generator push its whole frame in one
-// call without relying on state-save behaviour when ConsumeSample returns false.
+// Storage lives in BSS (global) so SampleBuffer needs no destructor.
+// A destructor on a stack-local C++ object inside a FreeRTOS task triggers
+// __cxa_atexit() registration at task entry, which aborts on ESP32 Arduino.
+static int16_t g_sampleBuf[2][1200][2];
+
+// Buffers all samples from one mp3.loop() call (up to one decoded frame).
+// Returning false only when full lets the generator push its whole frame in
+// one call without relying on state-save behaviour when ConsumeSample returns false.
 class SampleBuffer : public AudioOutput {
 public:
     int16_t (*buf)[2] = nullptr;
     int      cap = 0, count = 0;
 
-    bool init(int capacity) {
-        buf = new int16_t[capacity][2];
-        cap = capacity;
-        return buf != nullptr;
-    }
-    ~SampleBuffer() { delete[] buf; }
+    void attach(int16_t (*b)[2], int c) { buf = b; cap = c; count = 0; }
     bool ConsumeSample(int16_t sample[2]) override {
         if (count >= cap) return false;
         buf[count][0] = sample[0]; buf[count][1] = sample[1];
@@ -166,8 +166,8 @@ void audioTask(void*) {
     // Sized at 1200 to fit one full frame; loop() fills it then returns true
     // so the generator always advances by a complete frame per call.
     SampleBuffer cap[2];
-    cap[0].init(1200);
-    cap[1].init(1200);
+    cap[0].attach(g_sampleBuf[0], 1200);
+    cap[1].attach(g_sampleBuf[1], 1200);
 
     struct Chan {
         bool     hasPending = false;
