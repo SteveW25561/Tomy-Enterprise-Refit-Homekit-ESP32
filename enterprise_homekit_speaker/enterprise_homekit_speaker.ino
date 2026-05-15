@@ -353,7 +353,10 @@ void actFire2() {
 
 void actFire3() {
     LOG1("Action: Fire everything\n");
-    // P → T → T → P → P → T → (T + P simultaneous)
+    // P → T → T → P → P → T → (T + P) — phaser banks 4+5 visually fire together,
+    // so we only schedule one phaser sound for that beat (the I2S audio task
+    // plays sounds sequentially, so a second overlapping phaser would just
+    // play back-to-back instead of doubling up).
     scheduleSnd(PHASER_MP3,  PHASER_MP3_LEN,  T.fe_p1);
     scheduleSnd(TORPEDO_MP3, TORPEDO_MP3_LEN, T.fe_t1);
     scheduleSnd(TORPEDO_MP3, TORPEDO_MP3_LEN, T.fe_t2);
