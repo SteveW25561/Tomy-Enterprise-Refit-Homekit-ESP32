@@ -151,9 +151,11 @@ static void playPcm(const int16_t* data, int len) {
             vTaskDelay(1);
         }
     }
-    for (int k = 0; k < 4096; k++) {
-        while (!i2sOut->ConsumeSample(silence)) vTaskDelay(1);
-    }
+    // Flush silence without a retry loop: this build's ConsumeSample returns
+    // false for zero-value samples, so the while(!...) vTaskDelay(1) pattern
+    // would spin for 4096 ms. Match the anthem path — call directly, ignore
+    // the return value.
+    for (int k = 0; k < 4096; k++) i2sOut->ConsumeSample(silence);
 }
 
 void audioTask(void*) {
