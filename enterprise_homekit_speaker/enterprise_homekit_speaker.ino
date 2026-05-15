@@ -158,9 +158,9 @@ static void addPcmVoice(const int16_t* data, int len, uint32_t schedMs) {
 void audioTask(void*) {
     i2sOut = new AudioOutputI2S();
     i2sOut->SetPinout(I2S_BCLK, I2S_LRC, I2S_DIN);
+    i2sOut->begin();   // install I2S driver; must call first so SetRate writes hardware registers
     i2sOut->SetRate(44100);
     i2sOut->SetGain(speakerVol * I2S_MAX_GAIN);
-    i2sOut->begin();   // install I2S driver up front; PCM path doesn't go through mp3.begin()
 
     SoundReq req;
     int16_t silence[2] = {0, 0};
@@ -195,49 +195,46 @@ void audioTask(void*) {
 
         // ── PCM mixer ────────────────────────────────────────────────────────
         uint32_t now = millis();
-        bool anyActive = false, anyPending = false;
+        bool anyActive = false;
         for (int i = 0; i < MAX_VOICES; i++) {
             if (voices[i].pending && (int32_t)(now - voices[i].startMs) >= 0) {
                 voices[i].pending = false;
                 voices[i].active  = true;
                 voices[i].pos     = 0;
             }
-            if (voices[i].active)  anyActive  = true;
-            if (voices[i].pending) anyPending = true;
+            if (voices[i].active) anyActive = true;
         }
 
         if (anyActive) {
             wasPlaying = true;
-            float gain = speakerVol * I2S_MAX_GAIN;
+            // Gain is applied once by ConsumeSample via SetGain — do NOT pre-multiply.
             // Process a batch (~5.8 ms of audio) before re-checking the queue.
             for (int batch = 0; batch < 256; batch++) {
                 int32_t mix = 0;
                 bool stillActive = false;
                 for (int i = 0; i < MAX_VOICES; i++) {
                     if (voices[i].active) {
-                        mix += voices[i].data[voices[i].pos++];
+                        mix += (int16_t)pgm_read_word(&voices[i].data[voices[i].pos]);
+                        voices[i].pos++;
                         if (voices[i].pos >= voices[i].len) voices[i].active = false;
                         else                                stillActive = true;
                     }
                 }
-                int32_t scaled = (int32_t)(mix * gain);
-                if (scaled >  32767) scaled =  32767;
-                if (scaled < -32767) scaled = -32767;
-                int16_t s = (int16_t)scaled;
+                if (mix >  32767) mix =  32767;
+                if (mix < -32767) mix = -32767;
+                int16_t s = (int16_t)mix;
                 int16_t out[2] = { s, s };  // mono → both stereo channels
                 i2sOut->ConsumeSample(out);
                 if (!stillActive) break;
             }
-        } else if (anyPending) {
-            taskYIELD();  // pending voices waiting for scheduled time; check again soon
         } else {
-            // Truly idle. Flush DMA once with silence after activity ends so the
-            // I2S peripheral does not replay the last buffer's contents.
+            // Idle or waiting for a scheduled voice. Feed the I2S DMA with silence
+            // so the hardware never replays stale audio data when the buffer drains.
             if (wasPlaying) {
                 for (int k = 0; k < 4096; k++) i2sOut->ConsumeSample(silence);
                 wasPlaying = false;
             }
-            vTaskDelay(5);
+            i2sOut->ConsumeSample(silence);  // blocks ~22µs at 44100 Hz — natural rate-limit
         }
     }
 }
