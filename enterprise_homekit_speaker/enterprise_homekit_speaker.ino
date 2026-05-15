@@ -168,7 +168,10 @@ void audioTask(void*) {
 
         i2sOut->SetGain(speakerVol * I2S_MAX_GAIN);
 
-        if (req.data == ANTHEM_MP3) {
+        // Route by length rather than data pointer: const file-scope arrays in C++
+        // have internal linkage and can produce distinct addresses across build
+        // contexts, making pointer comparison unreliable. Lengths are unique.
+        if (req.len == ANTHEM_MP3_LEN) {
             AudioFileSourcePROGMEM src(req.data, req.len);
             AudioGeneratorMP3 mp3;
             mp3.begin(&src, i2sOut);
@@ -178,9 +181,9 @@ void audioTask(void*) {
             }
             for (int k = 0; k < 4096; k++) i2sOut->ConsumeSample(silence);
             i2sOut->SetRate(44100);
-        } else if (req.data == PHASER_MP3) {
+        } else if (req.len == PHASER_MP3_LEN) {
             playPcm(PHASER_PCM, PHASER_PCM_LEN);
-        } else if (req.data == TORPEDO_MP3) {
+        } else if (req.len == TORPEDO_MP3_LEN) {
             playPcm(TORPEDO_PCM, TORPEDO_PCM_LEN);
         }
     }
