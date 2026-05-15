@@ -130,30 +130,46 @@ void scheduleSnd(const uint8_t* data, size_t len, uint32_t delayMs) {
     if (q) xQueueSend(q, &r, 0);
 }
 
-// Accepts exactly one sample per mp3.loop() call. Returning false on the second
-// ConsumeSample causes the MP3 generator to save its frame position and retry
-// on the next call, giving sample-accurate interleaving without AudioOutputMixer.
-class SampleCapture : public AudioOutput {
+// Buffers all samples produced by one mp3.loop() call (up to one decoded frame).
+// Returning false only when full lets the generator push its whole frame in one
+// call without relying on state-save behaviour when ConsumeSample returns false.
+class SampleBuffer : public AudioOutput {
 public:
-    int16_t s[2] = {0, 0};
-    bool    ready = false;
-    bool ConsumeSample(int16_t sample[2]) override {
-        if (ready) return false;
-        s[0] = sample[0]; s[1] = sample[1];
-        ready = true;
-        return true;
+    int16_t (*buf)[2] = nullptr;
+    int      cap = 0, count = 0;
+
+    bool init(int capacity) {
+        buf = new int16_t[capacity][2];
+        cap = capacity;
+        return buf != nullptr;
     }
-    bool stop() override { s[0] = s[1] = 0; ready = false; return true; }
+    ~SampleBuffer() { delete[] buf; }
+    bool ConsumeSample(int16_t sample[2]) override {
+        if (count >= cap) return false;
+        buf[count][0] = sample[0]; buf[count][1] = sample[1];
+        count++; return true;
+    }
+    void reset() { count = 0; }
+    bool stop() override { count = 0; return true; }
 };
 
 void audioTask(void*) {
     i2sOut = new AudioOutputI2S();
     i2sOut->SetPinout(I2S_BCLK, I2S_LRC, I2S_DIN);
+    i2sOut->SetRate(44100);
+    i2sOut->SetBitsPerSample(16);
+    i2sOut->SetChannels(2);
     i2sOut->SetGain(speakerVol * I2S_MAX_GAIN);
     i2sOut->begin();  // install I2S driver; not called via mp3.begin() in this architecture
 
     QueueHandle_t* queues[2] = { &torpedoQueue, &phaserQueue };
-    SampleCapture  cap[2];
+
+    // Each SampleBuffer holds one decoded MP3 frame (~576–1152 samples).
+    // Sized at 1200 to fit one full frame; loop() fills it then returns true
+    // so the generator always advances by a complete frame per call.
+    SampleBuffer cap[2];
+    cap[0].init(1200);
+    cap[1].init(1200);
 
     struct Chan {
         bool     hasPending = false;
@@ -162,10 +178,12 @@ void audioTask(void*) {
         AudioGeneratorMP3*      mp3 = nullptr;
     } ch[2];
 
+    int16_t silence[2] = {0, 0};
+
     for (;;) {
         uint32_t now = millis();
 
-        // ── Queue management: start sounds when their scheduled time arrives ──
+        // ── Queue management ──────────────────────────────────────────────────
         for (int i = 0; i < 2; i++) {
             Chan& c = ch[i];
             if (!c.hasPending && !c.mp3) {
@@ -183,38 +201,42 @@ void audioTask(void*) {
             }
         }
 
-        // ── Sample mixing: process a batch then re-check queues ───────────────
-        // Each mp3.loop() call delivers exactly one sample (SampleCapture returns
-        // false on the second ConsumeSample, causing the generator to pause).
-        // When both channels are idle we push silence so the I2S DMA buffers are
-        // always filled with zeros rather than replaying the last sound.
+        // ── Sample mixing ─────────────────────────────────────────────────────
         bool anyPlaying = ch[0].mp3 || ch[1].mp3 || ch[0].hasPending || ch[1].hasPending;
 
         if (anyPlaying) {
-            for (int n = 0; n < 128; n++) {
-                bool got[2] = {false, false};
-                for (int i = 0; i < 2; i++) {
-                    if (ch[i].mp3) {
-                        cap[i].ready = false;
-                        if (!ch[i].mp3->loop()) {
-                            ch[i].mp3->stop();
-                            delete ch[i].mp3; ch[i].mp3 = nullptr;
-                            delete ch[i].src; ch[i].src = nullptr;
-                        }
-                        got[i] = cap[i].ready;
+            // Decode one frame per active channel into its buffer, then mix.
+            // Both channels fill independently; shorter one is padded with zeros.
+            cap[0].reset(); cap[1].reset();
+            for (int i = 0; i < 2; i++) {
+                if (ch[i].mp3) {
+                    if (!ch[i].mp3->loop()) {
+                        ch[i].mp3->stop();
+                        delete ch[i].mp3; ch[i].mp3 = nullptr;
+                        delete ch[i].src; ch[i].src = nullptr;
                     }
                 }
+            }
+            int n = max(cap[0].count, cap[1].count);
+            for (int s = 0; s < n; s++) {
                 int16_t out[2] = {
-                    (int16_t)constrain((int32_t)(got[0] ? cap[0].s[0] : 0) + (got[1] ? cap[1].s[0] : 0), -32767, 32767),
-                    (int16_t)constrain((int32_t)(got[0] ? cap[0].s[1] : 0) + (got[1] ? cap[1].s[1] : 0), -32767, 32767)
+                    (int16_t)constrain(
+                        (int32_t)(s < cap[0].count ? cap[0].buf[s][0] : 0) +
+                                  (s < cap[1].count ? cap[1].buf[s][0] : 0), -32767, 32767),
+                    (int16_t)constrain(
+                        (int32_t)(s < cap[0].count ? cap[0].buf[s][1] : 0) +
+                                  (s < cap[1].count ? cap[1].buf[s][1] : 0), -32767, 32767)
                 };
                 while (!i2sOut->ConsumeSample(out)) taskYIELD();
-                if (!ch[0].mp3 && !ch[1].mp3) break;
             }
+            if (n == 0) taskYIELD();  // pending but not started yet; yield briefly
         } else {
-            int16_t silence[2] = {0, 0};
-            while (!i2sOut->ConsumeSample(silence)) taskYIELD();
-            vTaskDelay(1);
+            // Idle: keep I2S DMA fed with silence so it never replays stale audio.
+            // Push a small batch then yield so other tasks get CPU time.
+            for (int k = 0; k < 64; k++) {
+                while (!i2sOut->ConsumeSample(silence)) taskYIELD();
+            }
+            taskYIELD();
         }
     }
 }
