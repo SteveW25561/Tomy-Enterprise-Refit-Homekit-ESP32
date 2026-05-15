@@ -132,12 +132,22 @@ void scheduleSnd(const uint8_t* data, size_t len, uint32_t delayMs) {
 
 static void playPcm(const int16_t* data, int len) {
     int16_t silence[2] = {0, 0};
-    for (int k = 0; k < len; k++) {
+    int k = 0;
+    while (k < len) {
         int16_t s = (int16_t)pgm_read_word(&data[k]);
         int16_t out[2] = {s, s};
-        i2sOut->ConsumeSample(out);
+        // ConsumeSample returns false if the DMA buffer can't accept the sample
+        // right now; do NOT advance — yield and retry, matching how
+        // AudioGeneratorMP3::loop() handles backpressure.
+        if (i2sOut->ConsumeSample(out)) {
+            k++;
+        } else {
+            vTaskDelay(1);
+        }
     }
-    for (int k = 0; k < 4096; k++) i2sOut->ConsumeSample(silence);
+    for (int k = 0; k < 4096; k++) {
+        while (!i2sOut->ConsumeSample(silence)) vTaskDelay(1);
+    }
 }
 
 void audioTask(void*) {
