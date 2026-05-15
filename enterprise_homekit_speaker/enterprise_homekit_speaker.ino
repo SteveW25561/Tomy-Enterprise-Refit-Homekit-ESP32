@@ -111,131 +111,52 @@ volatile float speakerVol = 0.25f;   // 0.0–1.0; start quiet so first power-on
 // software scale clips noticeably; keep this conservative.
 #define I2S_MAX_GAIN  0.5f
 
-// ── I2S audio task + dual-channel scheduled sound queue ────────────────────
-// Two independent channels (torpedo/anthem and phaser) are mixed manually and
-// fed directly to AudioOutputI2S — no AudioOutputMixer is used.
-// SampleCapture accepts exactly one sample per mp3.loop() call; the task mixes
-// both channels sample-by-sample and continuously outputs to i2sOut (silence
-// when idle) so the I2S DMA buffers never replay stale audio.
+// ── I2S audio task + scheduled sound queue ─────────────────────────────────
+// scheduleSnd() is non-blocking: it hands a request to the queue and returns.
+// audioTask() pulls requests off the queue, waits until their scheduled time,
+// then decodes & plays the MP3 through the MAX98357A. After each sound a block
+// of silence is written to flush the I2S DMA, preventing a buzz/rattle from
+// the peripheral replaying its last buffer.
 struct SoundReq { const uint8_t* data; size_t len; uint32_t schedMs; };
-#define SOUND_QUEUE_SIZE 10
-QueueHandle_t  torpedoQueue = nullptr;
-QueueHandle_t  phaserQueue  = nullptr;
-AudioOutputI2S* i2sOut      = nullptr;
+#define SOUND_QUEUE_SIZE 20
+QueueHandle_t  soundQueue = nullptr;
+AudioOutputI2S* i2sOut    = nullptr;
 
 void scheduleSnd(const uint8_t* data, size_t len, uint32_t delayMs) {
     if (audioMode != AUDIO_SPEAKER) return;
+    if (!soundQueue) return;
     SoundReq r = { data, len, millis() + delayMs };
-    QueueHandle_t q = (data == PHASER_MP3) ? phaserQueue : torpedoQueue;
-    if (q) xQueueSend(q, &r, 0);
+    xQueueSend(soundQueue, &r, 0);
 }
-
-// Storage lives in BSS (global) so SampleBuffer needs no destructor.
-// A destructor on a stack-local C++ object inside a FreeRTOS task triggers
-// __cxa_atexit() registration at task entry, which aborts on ESP32 Arduino.
-static int16_t g_sampleBuf[2][1200][2];
-
-// Buffers all samples from one mp3.loop() call (up to one decoded frame).
-// Returning false only when full lets the generator push its whole frame in
-// one call without relying on state-save behaviour when ConsumeSample returns false.
-class SampleBuffer : public AudioOutput {
-public:
-    int16_t (*buf)[2] = nullptr;
-    int      cap = 0, count = 0;
-
-    void attach(int16_t (*b)[2], int c) { buf = b; cap = c; count = 0; }
-    bool ConsumeSample(int16_t sample[2]) override {
-        if (count >= cap) return false;
-        buf[count][0] = sample[0]; buf[count][1] = sample[1];
-        count++; return true;
-    }
-    void reset() { count = 0; }
-    bool stop() override { count = 0; return true; }
-};
 
 void audioTask(void*) {
     i2sOut = new AudioOutputI2S();
     i2sOut->SetPinout(I2S_BCLK, I2S_LRC, I2S_DIN);
-    i2sOut->SetRate(44100);
     i2sOut->SetGain(speakerVol * I2S_MAX_GAIN);
-    i2sOut->begin();  // install I2S driver; not called via mp3.begin() in this architecture
 
-    QueueHandle_t* queues[2] = { &torpedoQueue, &phaserQueue };
-
-    // Each SampleBuffer holds one decoded MP3 frame (~576–1152 samples).
-    // Sized at 1200 to fit one full frame; loop() fills it then returns true
-    // so the generator always advances by a complete frame per call.
-    SampleBuffer cap[2];
-    cap[0].attach(g_sampleBuf[0], 1200);
-    cap[1].attach(g_sampleBuf[1], 1200);
-
-    struct Chan {
-        bool     hasPending = false;
-        SoundReq pending    = {};
-        AudioFileSourcePROGMEM* src = nullptr;
-        AudioGeneratorMP3*      mp3 = nullptr;
-    } ch[2];
-
+    SoundReq req;
     int16_t silence[2] = {0, 0};
-
     for (;;) {
-        uint32_t now = millis();
+        if (xQueueReceive(soundQueue, &req, pdMS_TO_TICKS(5)) == pdTRUE) {
+            int32_t wait = (int32_t)(req.schedMs - millis());
+            if (wait > 0) vTaskDelay(pdMS_TO_TICKS(wait));
 
-        // ── Queue management ──────────────────────────────────────────────────
-        for (int i = 0; i < 2; i++) {
-            Chan& c = ch[i];
-            if (!c.hasPending && !c.mp3) {
-                SoundReq r;
-                if (xQueueReceive(*queues[i], &r, 0) == pdTRUE) {
-                    c.pending = r; c.hasPending = true;
-                }
+            // Re-apply gain on every play so volume-slider changes take effect.
+            i2sOut->SetGain(speakerVol * I2S_MAX_GAIN);
+
+            AudioFileSourcePROGMEM src(req.data, req.len);
+            AudioGeneratorMP3 mp3;
+            mp3.begin(&src, i2sOut);
+            while (mp3.isRunning()) {
+                if (!mp3.loop()) { mp3.stop(); break; }
+                vTaskDelay(1);
             }
-            if (c.hasPending && (int32_t)(now - c.pending.schedMs) >= 0) {
-                c.hasPending = false;
-                i2sOut->SetGain(speakerVol * I2S_MAX_GAIN);
-                c.src = new AudioFileSourcePROGMEM(c.pending.data, c.pending.len);
-                c.mp3 = new AudioGeneratorMP3();
-                c.mp3->begin(c.src, &cap[i]);
-            }
+
+            // Flush I2S DMA buffers with silence so the peripheral does not
+            // replay the final non-zero samples of the sound that just ended.
+            for (int k = 0; k < 4096; k++) i2sOut->ConsumeSample(silence);
         }
-
-        // ── Sample mixing ─────────────────────────────────────────────────────
-        bool anyPlaying = ch[0].mp3 || ch[1].mp3 || ch[0].hasPending || ch[1].hasPending;
-
-        if (anyPlaying) {
-            // Decode one frame per active channel into its buffer, then mix.
-            // Both channels fill independently; shorter one is padded with zeros.
-            cap[0].reset(); cap[1].reset();
-            for (int i = 0; i < 2; i++) {
-                if (ch[i].mp3) {
-                    if (!ch[i].mp3->loop()) {
-                        ch[i].mp3->stop();
-                        delete ch[i].mp3; ch[i].mp3 = nullptr;
-                        delete ch[i].src; ch[i].src = nullptr;
-                    }
-                }
-            }
-            int n = max(cap[0].count, cap[1].count);
-            for (int s = 0; s < n; s++) {
-                int16_t out[2] = {
-                    (int16_t)constrain(
-                        (int32_t)(s < cap[0].count ? cap[0].buf[s][0] : 0) +
-                                  (s < cap[1].count ? cap[1].buf[s][0] : 0), -32767, 32767),
-                    (int16_t)constrain(
-                        (int32_t)(s < cap[0].count ? cap[0].buf[s][1] : 0) +
-                                  (s < cap[1].count ? cap[1].buf[s][1] : 0), -32767, 32767)
-                };
-                while (!i2sOut->ConsumeSample(out)) taskYIELD();
-            }
-            if (n == 0) taskYIELD();  // pending but not started yet; yield briefly
-        } else {
-            // Idle: keep I2S DMA fed with silence so it never replays stale audio.
-            // Push a small batch then yield so other tasks get CPU time.
-            for (int k = 0; k < 64; k++) {
-                while (!i2sOut->ConsumeSample(silence)) taskYIELD();
-            }
-            taskYIELD();
-        }
+        vTaskDelay(1);
     }
 }
 
@@ -1032,9 +953,8 @@ void setup() {
 
     // I2S audio task — created before HomeSpan so the first action (e.g. an
     // Anthem trigger right after reboot) finds the queue ready.
-    torpedoQueue = xQueueCreate(SOUND_QUEUE_SIZE, sizeof(SoundReq));
-    phaserQueue  = xQueueCreate(SOUND_QUEUE_SIZE, sizeof(SoundReq));
-    xTaskCreatePinnedToCore(audioTask, "Audio", 16384, NULL, 2, NULL, 1);
+    soundQueue = xQueueCreate(SOUND_QUEUE_SIZE, sizeof(SoundReq));
+    xTaskCreatePinnedToCore(audioTask, "Audio", 8192, NULL, 2, NULL, 1);
 
     Serial.println("\n╔════════════════════════════════════════════════╗");
     Serial.println(  "║   USS Enterprise NCC-1701 — Speaker Edition    ║");
