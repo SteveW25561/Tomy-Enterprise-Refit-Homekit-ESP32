@@ -158,9 +158,9 @@ static void addPcmVoice(const int16_t* data, int len, uint32_t schedMs) {
 void audioTask(void*) {
     i2sOut = new AudioOutputI2S();
     i2sOut->SetPinout(I2S_BCLK, I2S_LRC, I2S_DIN);
-    i2sOut->begin();   // install I2S driver; must call first so SetRate writes hardware registers
     i2sOut->SetRate(44100);
     i2sOut->SetGain(speakerVol * I2S_MAX_GAIN);
+    i2sOut->begin();   // install I2S driver up front; PCM path doesn't go through mp3.begin()
 
     SoundReq req;
     int16_t silence[2] = {0, 0};
@@ -234,7 +234,10 @@ void audioTask(void*) {
                 for (int k = 0; k < 4096; k++) i2sOut->ConsumeSample(silence);
                 wasPlaying = false;
             }
-            i2sOut->ConsumeSample(silence);  // blocks ~22µs at 44100 Hz — natural rate-limit
+            // Pre-fill DMA with ~6 ms of silence, then yield so HomeSpan and the
+            // FreeRTOS idle task on Core 1 get CPU time (otherwise we hang boot).
+            for (int k = 0; k < 256; k++) i2sOut->ConsumeSample(silence);
+            vTaskDelay(1);
         }
     }
 }
