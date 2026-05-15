@@ -157,8 +157,6 @@ void audioTask(void*) {
     i2sOut = new AudioOutputI2S();
     i2sOut->SetPinout(I2S_BCLK, I2S_LRC, I2S_DIN);
     i2sOut->SetRate(44100);
-    i2sOut->SetBitsPerSample(16);
-    i2sOut->SetChannels(2);
     i2sOut->SetGain(speakerVol * I2S_MAX_GAIN);
     i2sOut->begin();  // install I2S driver; not called via mp3.begin() in this architecture
 
