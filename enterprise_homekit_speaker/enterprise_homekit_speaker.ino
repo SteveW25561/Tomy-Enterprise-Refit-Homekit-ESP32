@@ -131,6 +131,12 @@ void scheduleSnd(const uint8_t* data, size_t len, uint32_t delayMs) {
 }
 
 static void playPcm(const int16_t* data, int len) {
+    // Mirror what mp3.begin() does for anthem: call begin() just before
+    // writing samples. On this ESP8266Audio build begin() may need to be
+    // called to prime the DMA before ConsumeSample will produce output.
+    i2sOut->begin();
+    i2sOut->SetRate(44100);
+    i2sOut->SetGain(speakerVol * I2S_MAX_GAIN);
     int16_t silence[2] = {0, 0};
     int k = 0;
     while (k < len) {
