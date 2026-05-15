@@ -116,10 +116,8 @@ volatile float speakerVol = 0.25f;   // 0.0–1.0; start quiet so first power-on
 // ── I2S audio task + scheduled sound queue ─────────────────────────────────
 // scheduleSnd() is non-blocking: it hands a request to the queue and returns.
 // audioTask() routes by sound:
-//   - phaser/torpedo → PCM voice (mixed sample-by-sample, up to MAX_VOICES at once)
-//   - anthem         → AudioGeneratorMP3 streamed directly to i2sOut (single channel)
-// PCM mixing avoids the dual-MP3-decoder fragility seen with AudioOutputMixer:
-// the realtime path is just "sum N int16s, clip, write to I2S".
+//   - phaser/torpedo → playPcm() — pre-decoded int16 PCM, sequential
+//   - anthem         → AudioGeneratorMP3 streamed directly to i2sOut
 struct SoundReq { const uint8_t* data; size_t len; uint32_t schedMs; };
 #define SOUND_QUEUE_SIZE 20
 QueueHandle_t   soundQueue = nullptr;
@@ -132,27 +130,14 @@ void scheduleSnd(const uint8_t* data, size_t len, uint32_t delayMs) {
     xQueueSend(soundQueue, &r, 0);
 }
 
-// ── PCM voice pool ─────────────────────────────────────────────────────────
-struct PcmVoice {
-    const int16_t* data;     // PROGMEM PCM samples (44100 Hz mono int16)
-    int            len;      // total samples in clip
-    int            pos;      // current sample index
-    uint32_t       startMs;  // scheduled start time (millis)
-    bool           active;   // currently producing samples
-    bool           pending;  // waiting for startMs to arrive
-};
-#define MAX_VOICES 4
-static PcmVoice voices[MAX_VOICES] = {};
-
-static void addPcmVoice(const int16_t* data, int len, uint32_t schedMs) {
-    for (int i = 0; i < MAX_VOICES; i++) {
-        if (!voices[i].active && !voices[i].pending) {
-            voices[i] = { data, len, 0, schedMs, false, true };
-            return;
-        }
+static void playPcm(const int16_t* data, int len) {
+    int16_t silence[2] = {0, 0};
+    for (int k = 0; k < len; k++) {
+        int16_t s = (int16_t)pgm_read_word(&data[k]);
+        int16_t out[2] = {s, s};
+        i2sOut->ConsumeSample(out);
     }
-    // No free slot — drop request silently. MAX_VOICES > worst-case overlap in
-    // Fire Everything (4 phaser + 4 torpedo, but no more than 2 simultaneous).
+    for (int k = 0; k < 4096; k++) i2sOut->ConsumeSample(silence);
 }
 
 void audioTask(void*) {
@@ -160,84 +145,33 @@ void audioTask(void*) {
     i2sOut->SetPinout(I2S_BCLK, I2S_LRC, I2S_DIN);
     i2sOut->SetRate(44100);
     i2sOut->SetGain(speakerVol * I2S_MAX_GAIN);
-    i2sOut->begin();   // install I2S driver up front; PCM path doesn't go through mp3.begin()
+    i2sOut->begin();
 
-    SoundReq req;
     int16_t silence[2] = {0, 0};
-    bool wasPlaying = false;
+    SoundReq req;
 
     for (;;) {
-        // ── Drain queue and dispatch by sound type ───────────────────────────
-        while (xQueueReceive(soundQueue, &req, 0) == pdTRUE) {
-            if (req.data == ANTHEM_MP3) {
-                // Anthem: wait for scheduled time, then stream the MP3 directly.
-                // Anthem doesn't overlap with weapons in practice; PCM voices
-                // wait their turn (anthem is ~37s, weapons fire much later).
-                int32_t wait = (int32_t)(req.schedMs - millis());
-                if (wait > 0) vTaskDelay(pdMS_TO_TICKS(wait));
-                i2sOut->SetGain(speakerVol * I2S_MAX_GAIN);
-                AudioFileSourcePROGMEM src(req.data, req.len);
-                AudioGeneratorMP3 mp3;
-                mp3.begin(&src, i2sOut);
-                while (mp3.isRunning()) {
-                    if (!mp3.loop()) { mp3.stop(); break; }
-                    vTaskDelay(1);
-                }
-                // Flush silence to clear DMA buffers after anthem ends.
-                for (int k = 0; k < 4096; k++) i2sOut->ConsumeSample(silence);
-                i2sOut->SetRate(44100);  // restore rate in case MP3 decoder changed it
-            } else if (req.data == PHASER_MP3) {
-                addPcmVoice(PHASER_PCM, PHASER_PCM_LEN, req.schedMs);
-            } else if (req.data == TORPEDO_MP3) {
-                addPcmVoice(TORPEDO_PCM, TORPEDO_PCM_LEN, req.schedMs);
-            }
-        }
+        if (xQueueReceive(soundQueue, &req, portMAX_DELAY) != pdTRUE) continue;
 
-        // ── PCM mixer ────────────────────────────────────────────────────────
-        uint32_t now = millis();
-        bool anyActive = false;
-        for (int i = 0; i < MAX_VOICES; i++) {
-            if (voices[i].pending && (int32_t)(now - voices[i].startMs) >= 0) {
-                voices[i].pending = false;
-                voices[i].active  = true;
-                voices[i].pos     = 0;
-            }
-            if (voices[i].active) anyActive = true;
-        }
+        int32_t wait = (int32_t)(req.schedMs - millis());
+        if (wait > 0) vTaskDelay(pdMS_TO_TICKS(wait));
 
-        if (anyActive) {
-            wasPlaying = true;
-            // Gain is applied once by ConsumeSample via SetGain — do NOT pre-multiply.
-            // Process a batch (~5.8 ms of audio) before re-checking the queue.
-            for (int batch = 0; batch < 256; batch++) {
-                int32_t mix = 0;
-                bool stillActive = false;
-                for (int i = 0; i < MAX_VOICES; i++) {
-                    if (voices[i].active) {
-                        mix += (int16_t)pgm_read_word(&voices[i].data[voices[i].pos]);
-                        voices[i].pos++;
-                        if (voices[i].pos >= voices[i].len) voices[i].active = false;
-                        else                                stillActive = true;
-                    }
-                }
-                if (mix >  32767) mix =  32767;
-                if (mix < -32767) mix = -32767;
-                int16_t s = (int16_t)mix;
-                int16_t out[2] = { s, s };  // mono → both stereo channels
-                i2sOut->ConsumeSample(out);
-                if (!stillActive) break;
+        i2sOut->SetGain(speakerVol * I2S_MAX_GAIN);
+
+        if (req.data == ANTHEM_MP3) {
+            AudioFileSourcePROGMEM src(req.data, req.len);
+            AudioGeneratorMP3 mp3;
+            mp3.begin(&src, i2sOut);
+            while (mp3.isRunning()) {
+                if (!mp3.loop()) { mp3.stop(); break; }
+                vTaskDelay(1);
             }
-        } else {
-            // Idle or waiting for a scheduled voice. Feed the I2S DMA with silence
-            // so the hardware never replays stale audio data when the buffer drains.
-            if (wasPlaying) {
-                for (int k = 0; k < 4096; k++) i2sOut->ConsumeSample(silence);
-                wasPlaying = false;
-            }
-            // Pre-fill DMA with ~6 ms of silence, then yield so HomeSpan and the
-            // FreeRTOS idle task on Core 1 get CPU time (otherwise we hang boot).
-            for (int k = 0; k < 256; k++) i2sOut->ConsumeSample(silence);
-            vTaskDelay(1);
+            for (int k = 0; k < 4096; k++) i2sOut->ConsumeSample(silence);
+            i2sOut->SetRate(44100);
+        } else if (req.data == PHASER_MP3) {
+            playPcm(PHASER_PCM, PHASER_PCM_LEN);
+        } else if (req.data == TORPEDO_MP3) {
+            playPcm(TORPEDO_PCM, TORPEDO_PCM_LEN);
         }
     }
 }
@@ -436,8 +370,7 @@ void actFire2() {
 void actFire3() {
     LOG1("Action: Fire everything\n");
     // P → T → T → P → P → T → (T + P) — phaser banks 4+5 fire together visually.
-    // The PCM mixer plays overlapping sounds simultaneously, so phaser sounds
-    // start at their scheduled times even when a torpedo is still finishing.
+    // Sequential PCM playback: sounds play in queue order, slightly late if previous runs long.
     scheduleSnd(PHASER_MP3,  PHASER_MP3_LEN,  T.fe_p1);
     scheduleSnd(TORPEDO_MP3, TORPEDO_MP3_LEN, T.fe_t1);
     scheduleSnd(TORPEDO_MP3, TORPEDO_MP3_LEN, T.fe_t2);
