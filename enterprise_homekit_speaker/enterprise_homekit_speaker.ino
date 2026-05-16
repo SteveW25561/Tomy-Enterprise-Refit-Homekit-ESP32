@@ -144,10 +144,30 @@ static void playPcm(const int16_t* data, int len) {
             vTaskDelay(1);
         }
     }
-    // Let the final DMA buffer finish playing, then stop the I2S driver.
-    // stop() zeros the DMA buffers and uninstalls the driver, preventing the
-    // hardware from replaying the last audio buffer as buzz after the sound ends.
-    // The begin() at the top of the next call reinstalls cleanly.
+    vTaskDelay(20);
+    i2sOut->stop();
+}
+
+// Plays two PCM streams mixed, with data2 starting at offsetSamples into data1.
+// Samples are summed and clamped; both clips have low peaks so clipping is unlikely.
+static void playPcmMixed(const int16_t* data1, int len1,
+                         const int16_t* data2, int len2,
+                         int offsetSamples) {
+    i2sOut->begin();
+    i2sOut->SetRate(44100);
+    i2sOut->SetGain(speakerVol * I2S_MAX_GAIN);
+    int total = max(len1, offsetSamples + len2);
+    for (int k = 0; k < total; k++) {
+        int32_t s = 0;
+        if (k < len1)
+            s += (int16_t)pgm_read_word(&data1[k]);
+        if (k >= offsetSamples && (k - offsetSamples) < len2)
+            s += (int16_t)pgm_read_word(&data2[k - offsetSamples]);
+        if (s >  32767) s =  32767;
+        if (s < -32768) s = -32768;
+        int16_t out[2] = {(int16_t)s, (int16_t)s};
+        while (!i2sOut->ConsumeSample(out)) vTaskDelay(1);
+    }
     vTaskDelay(20);
     i2sOut->stop();
 }
@@ -183,10 +203,28 @@ void audioTask(void*) {
             }
             for (int k = 0; k < 4096; k++) i2sOut->ConsumeSample(silence);
             i2sOut->SetRate(44100);
-        } else if (req.len == PHASER_MP3_LEN) {
-            playPcm(PHASER_PCM, PHASER_PCM_LEN);
-        } else if (req.len == TORPEDO_MP3_LEN) {
-            playPcm(TORPEDO_PCM, TORPEDO_PCM_LEN);
+        } else if (req.len == PHASER_MP3_LEN || req.len == TORPEDO_MP3_LEN) {
+            const int16_t* pcm1    = (req.len == PHASER_MP3_LEN) ? PHASER_PCM    : TORPEDO_PCM;
+            int            pcmLen1 = (req.len == PHASER_MP3_LEN) ? PHASER_PCM_LEN : TORPEDO_PCM_LEN;
+            uint32_t       startMs = millis();
+            uint32_t       endMs   = startMs + (uint32_t)pcmLen1 * 1000UL / 44100UL;
+
+            // Peek at the next queued sound. If it's a PCM clip scheduled to start
+            // before this one finishes, pull it out and mix both in one pass.
+            SoundReq nxt;
+            if (xQueuePeek(soundQueue, &nxt, 0) == pdTRUE &&
+                nxt.len != ANTHEM_MP3_LEN &&
+                (int32_t)(nxt.schedMs - endMs) < 0) {
+                xQueueReceive(soundQueue, &nxt, 0);
+                const int16_t* pcm2    = (nxt.len == PHASER_MP3_LEN) ? PHASER_PCM    : TORPEDO_PCM;
+                int            pcmLen2 = (nxt.len == PHASER_MP3_LEN) ? PHASER_PCM_LEN : TORPEDO_PCM_LEN;
+                int32_t        offsetMs = (int32_t)(nxt.schedMs - startMs);
+                if (offsetMs < 0) offsetMs = 0;
+                int offsetSamples = (int)(offsetMs * 44100L / 1000L);
+                playPcmMixed(pcm1, pcmLen1, pcm2, pcmLen2, offsetSamples);
+            } else {
+                playPcm(pcm1, pcmLen1);
+            }
         }
     }
 }
