@@ -89,9 +89,6 @@
 #include <AudioFileSourcePROGMEM.h>
 #include <AudioGeneratorMP3.h>
 #include <AudioOutputI2S.h>
-// Forward-declare without pulling in driver/i2s.h — the symbol is linked in by ESP8266Audio.
-// Including the legacy header directly can cause type-redefinition conflicts on ESP-IDF 5.x.
-extern "C" int i2s_zero_dma_buffer(int i2s_num);
 #include "anthem_mp3.h"    // Anthem startup music — streamed via MP3 decoder (too big to pre-decode)
 #include "torpedo_mp3.h"   // kept so action funcs can pass TORPEDO_MP3 as a routing token
 #include "phaser_mp3.h"    // kept so action funcs can pass PHASER_MP3 as a routing token
@@ -134,7 +131,7 @@ void scheduleSnd(const uint8_t* data, size_t len, uint32_t delayMs) {
 }
 
 static void playPcm(const int16_t* data, int len) {
-    // SetRate on a running driver calls i2s_set_clk — fast path, no reinstall.
+    i2sOut->begin();
     i2sOut->SetRate(44100);
     i2sOut->SetGain(speakerVol * I2S_MAX_GAIN);
     int k = 0;
@@ -147,18 +144,20 @@ static void playPcm(const int16_t* data, int len) {
             vTaskDelay(1);
         }
     }
-    // Let the last DMA buffer drain, then zero the hardware buffers directly.
-    // ConsumeSample rejects {0,0} on this build so silence flush via it is a no-op.
-    vTaskDelay(10);
-    i2s_zero_dma_buffer(0);
+    // Let the final DMA buffer finish playing, then stop the I2S driver.
+    // stop() zeros the DMA buffers and uninstalls the driver, preventing the
+    // hardware from replaying the last audio buffer as buzz after the sound ends.
+    // The begin() at the top of the next call reinstalls cleanly.
+    vTaskDelay(20);
+    i2sOut->stop();
 }
 
 void audioTask(void*) {
     i2sOut = new AudioOutputI2S();
     i2sOut->SetPinout(I2S_BCLK, I2S_LRC, I2S_DIN);
-    i2sOut->begin();            // install I2S driver first
-    i2sOut->SetRate(44100);     // SetRate after begin() calls i2s_set_clk on the running driver
+    i2sOut->SetRate(44100);
     i2sOut->SetGain(speakerVol * I2S_MAX_GAIN);
+    i2sOut->begin();
 
     int16_t silence[2] = {0, 0};
     SoundReq req;
