@@ -89,9 +89,11 @@
 #include <AudioFileSourcePROGMEM.h>
 #include <AudioGeneratorMP3.h>
 #include <AudioOutputI2S.h>
-#include "anthem_mp3.h"   // Anthem startup music
-#include "torpedo_mp3.h"  // Torpedo launch sound (~841ms)
-#include "phaser_mp3.h"   // Phaser fire sound (~763ms)
+#include "anthem_mp3.h"    // Anthem startup music — streamed via MP3 decoder (too big to pre-decode)
+#include "torpedo_mp3.h"   // kept so action funcs can pass TORPEDO_MP3 as a routing token
+#include "phaser_mp3.h"    // kept so action funcs can pass PHASER_MP3 as a routing token
+#include "torpedo_pcm.h"   // 44100 Hz mono int16 PCM, ~759ms — generated from torpedo_mp3.h
+#include "phaser_pcm.h"    // 44100 Hz mono int16 PCM, ~689ms — generated from phaser_mp3.h
 
 // ── Pins ───────────────────────────────────────────────────────────────────
 static constexpr int PIN_A    = 4;
@@ -105,7 +107,7 @@ static constexpr int I2S_DIN  = 8;
 // AUDIO_SPEAKER: sounds play through the I2S amp/speaker in the base
 #define AUDIO_BROWSER 0
 #define AUDIO_SPEAKER 1
-volatile int   audioMode  = AUDIO_BROWSER;
+volatile int   audioMode  = AUDIO_SPEAKER;
 volatile float speakerVol = 0.25f;   // 0.0–1.0; start quiet so first power-on doesn't blast
 // MAX98357A is already at its 9 dB hardware gain. Anything above ~0.5 of full
 // software scale clips noticeably; keep this conservative.
@@ -113,12 +115,15 @@ volatile float speakerVol = 0.25f;   // 0.0–1.0; start quiet so first power-on
 
 // ── I2S audio task + scheduled sound queue ─────────────────────────────────
 // scheduleSnd() is non-blocking: it hands a request to the queue and returns.
-// audioTask() pulls requests off the queue, waits until their scheduled time,
-// then decodes & plays the MP3 through the MAX98357A.
+// audioTask() routes by sound:
+//   - phaser/torpedo → playMixedVoices() — pre-decoded int16 PCM, greedy mixer
+//                      pulls every queued clip that overlaps the running window
+//   - anthem         → AudioGeneratorMP3 streamed directly to i2sOut
 struct SoundReq { const uint8_t* data; size_t len; uint32_t schedMs; };
+struct Voice     { const int16_t* data; int len;   int offsetSamples; };
 #define SOUND_QUEUE_SIZE 20
-QueueHandle_t  soundQueue = nullptr;
-AudioOutputI2S* i2sOut    = nullptr;
+QueueHandle_t   soundQueue = nullptr;
+AudioOutputI2S* i2sOut     = nullptr;
 
 void scheduleSnd(const uint8_t* data, size_t len, uint32_t delayMs) {
     if (audioMode != AUDIO_SPEAKER) return;
@@ -127,21 +132,56 @@ void scheduleSnd(const uint8_t* data, size_t len, uint32_t delayMs) {
     xQueueSend(soundQueue, &r, 0);
 }
 
+// Plays up to N PCM voices mixed together, each starting at its own sample offset.
+// Samples are summed and clamped; clip peaks are low (~6000 of 32767) so 3-4 voices
+// stay well within int16 range even when fully overlapping.
+static void playMixedVoices(const Voice* voices, int numVoices) {
+    i2sOut->begin();
+    i2sOut->SetRate(44100);
+    i2sOut->SetGain(speakerVol * I2S_MAX_GAIN);
+    int total = 0;
+    for (int v = 0; v < numVoices; v++) {
+        int endK = voices[v].offsetSamples + voices[v].len;
+        if (endK > total) total = endK;
+    }
+    for (int k = 0; k < total; k++) {
+        int32_t s = 0;
+        for (int v = 0; v < numVoices; v++) {
+            int idx = k - voices[v].offsetSamples;
+            if (idx >= 0 && idx < voices[v].len)
+                s += (int16_t)pgm_read_word(&voices[v].data[idx]);
+        }
+        if (s >  32767) s =  32767;
+        if (s < -32768) s = -32768;
+        int16_t out[2] = {(int16_t)s, (int16_t)s};
+        while (!i2sOut->ConsumeSample(out)) vTaskDelay(1);
+    }
+    vTaskDelay(20);
+    i2sOut->stop();
+}
+
 void audioTask(void*) {
     i2sOut = new AudioOutputI2S();
     i2sOut->SetPinout(I2S_BCLK, I2S_LRC, I2S_DIN);
+    i2sOut->SetRate(44100);
     i2sOut->SetGain(speakerVol * I2S_MAX_GAIN);
+    i2sOut->begin();
 
+    int16_t silence[2] = {0, 0};
     SoundReq req;
+
     for (;;) {
-        if (xQueueReceive(soundQueue, &req, pdMS_TO_TICKS(5)) == pdTRUE) {
-            int32_t wait = (int32_t)(req.schedMs - millis());
-            if (wait > 0) vTaskDelay(pdMS_TO_TICKS(wait));
+        if (xQueueReceive(soundQueue, &req, portMAX_DELAY) != pdTRUE) continue;
 
-            // Re-apply gain on every play so volume-slider changes take effect
-            // immediately — without this the SetGain() above only runs once.
-            i2sOut->SetGain(speakerVol * I2S_MAX_GAIN);
+        int32_t wait = (int32_t)(req.schedMs - millis());
+        if (wait > 0) vTaskDelay(pdMS_TO_TICKS(wait));
 
+        i2sOut->SetGain(speakerVol * I2S_MAX_GAIN);
+
+        // Route by length rather than data pointer: const file-scope arrays in C++
+        // have internal linkage and can produce distinct addresses across build
+        // contexts, making pointer comparison unreliable. Lengths are unique.
+        if (req.len == ANTHEM_MP3_LEN) {
             AudioFileSourcePROGMEM src(req.data, req.len);
             AudioGeneratorMP3 mp3;
             mp3.begin(&src, i2sOut);
@@ -149,8 +189,41 @@ void audioTask(void*) {
                 if (!mp3.loop()) { mp3.stop(); break; }
                 vTaskDelay(1);
             }
+            for (int k = 0; k < 4096; k++) i2sOut->ConsumeSample(silence);
+            i2sOut->SetRate(44100);
+        } else if (req.len == PHASER_MP3_LEN || req.len == TORPEDO_MP3_LEN) {
+            // Greedily collect all queued PCM clips that overlap with the running
+            // playback window, then render them in a single mixed pass so that
+            // 3-way overlaps (e.g. Fire Everything t1+t2+p2) play correctly.
+            constexpr int MAX_VOICES = 4;
+            Voice voices[MAX_VOICES];
+            int numVoices = 0;
+            uint32_t startMs = millis();
+            auto pcmDataFor = [](size_t l) -> const int16_t* {
+                return (l == PHASER_MP3_LEN) ? PHASER_PCM : TORPEDO_PCM;
+            };
+            auto pcmLenFor = [](size_t l) -> int {
+                return (l == PHASER_MP3_LEN) ? PHASER_PCM_LEN : TORPEDO_PCM_LEN;
+            };
+            voices[numVoices++] = { pcmDataFor(req.len), pcmLenFor(req.len), 0 };
+            int endSample = voices[0].len;
+
+            while (numVoices < MAX_VOICES) {
+                SoundReq nxt;
+                if (xQueuePeek(soundQueue, &nxt, 0) != pdTRUE) break;
+                if (nxt.len == ANTHEM_MP3_LEN) break;
+                int32_t offsetMs = (int32_t)(nxt.schedMs - startMs);
+                if (offsetMs < 0) offsetMs = 0;
+                int offsetSamples = (int)(offsetMs * 44100L / 1000L);
+                if (offsetSamples >= endSample) break;   // no overlap with any active voice
+                xQueueReceive(soundQueue, &nxt, 0);
+                int len2 = pcmLenFor(nxt.len);
+                voices[numVoices++] = { pcmDataFor(nxt.len), len2, offsetSamples };
+                int newEnd = offsetSamples + len2;
+                if (newEnd > endSample) endSample = newEnd;
+            }
+            playMixedVoices(voices, numVoices);
         }
-        vTaskDelay(1);
     }
 }
 
@@ -209,11 +282,11 @@ struct Timing {
     int phaser_delay      =  1900;
     // Fire 2
     int f2_torp1          =  2900;
-    int f2_torp2          =  3200;
+    int f2_torp2          =  3400;
     // Fire Everything
     int fe_p1             =  3000;
     int fe_t1             =  4700;
-    int fe_t2             =  5100;
+    int fe_t2             =  5200;
     int fe_p2             =  5800;
     int fe_p3             =  8700;
     int fe_t3             =  9900;
@@ -241,7 +314,7 @@ void loadTimings() {
     T.anthem_wait     = prefs.getInt("anthem_wait",     T.anthem_wait);
     T.anthem_gap      = prefs.getInt("anthem_gap",      T.anthem_gap);
     T.anthem_last_gap = prefs.getInt("anthem_last_gap", T.anthem_last_gap);
-    audioMode         = prefs.getInt  ("audio_mode",   AUDIO_BROWSER);
+    audioMode         = prefs.getInt  ("audio_mode",   AUDIO_SPEAKER);
     speakerVol        = prefs.getFloat("speaker_vol",  0.25f);
     prefs.end();
     Serial.println("Settings loaded from NVS");
@@ -347,10 +420,8 @@ void actFire2() {
 
 void actFire3() {
     LOG1("Action: Fire everything\n");
-    // P → T → T → P → P → T → (T + P) — phaser banks 4+5 visually fire together,
-    // so we only schedule one phaser sound for that beat (the I2S audio task
-    // plays sounds sequentially, so a second overlapping phaser would just
-    // play back-to-back instead of doubling up).
+    // P → T → T → P → P → T → (T + P) — phaser banks 4+5 fire together visually.
+    // Sequential PCM playback: sounds play in queue order, slightly late if previous runs long.
     scheduleSnd(PHASER_MP3,  PHASER_MP3_LEN,  T.fe_p1);
     scheduleSnd(TORPEDO_MP3, TORPEDO_MP3_LEN, T.fe_t1);
     scheduleSnd(TORPEDO_MP3, TORPEDO_MP3_LEN, T.fe_t2);
@@ -685,8 +756,8 @@ function volChange(v) {
 // Timing values — defaults shown; overwritten by loadTimings() from ESP32 NVS
 var T = {
   phaser_delay:1900,
-  f2_torp1:2900,  f2_torp2:3200,
-  fe_p1:3000,     fe_t1:4700,   fe_t2:5100,
+  f2_torp1:2900,  f2_torp2:3400,
+  fe_p1:3000,     fe_t1:4700,   fe_t2:5200,
   fe_p2:5800,     fe_p3:8700,
   fe_t3:9900,     fe_t4:10700,  fe_p4:11100,
   anthem_wait:17000, anthem_gap:2000, anthem_last_gap:2000
