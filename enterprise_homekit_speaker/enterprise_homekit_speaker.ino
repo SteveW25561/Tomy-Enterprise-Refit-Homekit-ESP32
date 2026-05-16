@@ -120,6 +120,7 @@ volatile float speakerVol = 0.25f;   // 0.0–1.0; start quiet so first power-on
 //                      pulls every queued clip that overlaps the running window
 //   - anthem         → AudioGeneratorMP3 streamed directly to i2sOut
 struct SoundReq { const uint8_t* data; size_t len; uint32_t schedMs; };
+struct Voice     { const int16_t* data; int len;   int offsetSamples; };
 #define SOUND_QUEUE_SIZE 20
 QueueHandle_t   soundQueue = nullptr;
 AudioOutputI2S* i2sOut     = nullptr;
@@ -134,7 +135,6 @@ void scheduleSnd(const uint8_t* data, size_t len, uint32_t delayMs) {
 // Plays up to N PCM voices mixed together, each starting at its own sample offset.
 // Samples are summed and clamped; clip peaks are low (~6000 of 32767) so 3-4 voices
 // stay well within int16 range even when fully overlapping.
-struct Voice { const int16_t* data; int len; int offsetSamples; };
 static void playMixedVoices(const Voice* voices, int numVoices) {
     i2sOut->begin();
     i2sOut->SetRate(44100);
