@@ -282,11 +282,11 @@ struct Timing {
     int phaser_delay      =  1900;
     // Fire 2
     int f2_torp1          =  2900;
-    int f2_torp2          =  3200;
+    int f2_torp2          =  3400;
     // Fire Everything
     int fe_p1             =  3000;
     int fe_t1             =  4700;
-    int fe_t2             =  5100;
+    int fe_t2             =  5200;
     int fe_p2             =  5800;
     int fe_p3             =  8700;
     int fe_t3             =  9900;
@@ -756,8 +756,8 @@ function volChange(v) {
 // Timing values — defaults shown; overwritten by loadTimings() from ESP32 NVS
 var T = {
   phaser_delay:1900,
-  f2_torp1:2900,  f2_torp2:3200,
-  fe_p1:3000,     fe_t1:4700,   fe_t2:5100,
+  f2_torp1:2900,  f2_torp2:3400,
+  fe_p1:3000,     fe_t1:4700,   fe_t2:5200,
   fe_p2:5800,     fe_p3:8700,
   fe_t3:9900,     fe_t4:10700,  fe_p4:11100,
   anthem_wait:17000, anthem_gap:2000, anthem_last_gap:2000
