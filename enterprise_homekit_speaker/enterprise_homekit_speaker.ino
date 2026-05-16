@@ -89,7 +89,9 @@
 #include <AudioFileSourcePROGMEM.h>
 #include <AudioGeneratorMP3.h>
 #include <AudioOutputI2S.h>
-#include "driver/i2s.h"
+// Forward-declare without pulling in driver/i2s.h — the symbol is linked in by ESP8266Audio.
+// Including the legacy header directly can cause type-redefinition conflicts on ESP-IDF 5.x.
+extern "C" int i2s_zero_dma_buffer(int i2s_num);
 #include "anthem_mp3.h"    // Anthem startup music — streamed via MP3 decoder (too big to pre-decode)
 #include "torpedo_mp3.h"   // kept so action funcs can pass TORPEDO_MP3 as a routing token
 #include "phaser_mp3.h"    // kept so action funcs can pass PHASER_MP3 as a routing token
@@ -148,7 +150,7 @@ static void playPcm(const int16_t* data, int len) {
     // Let the last DMA buffer drain, then zero the hardware buffers directly.
     // ConsumeSample rejects {0,0} on this build so silence flush via it is a no-op.
     vTaskDelay(10);
-    i2s_zero_dma_buffer((i2s_port_t)0);
+    i2s_zero_dma_buffer(0);
 }
 
 void audioTask(void*) {
