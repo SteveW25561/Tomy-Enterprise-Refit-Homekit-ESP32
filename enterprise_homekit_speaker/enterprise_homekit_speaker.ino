@@ -116,7 +116,8 @@ volatile float speakerVol = 0.25f;   // 0.0–1.0; start quiet so first power-on
 // ── I2S audio task + scheduled sound queue ─────────────────────────────────
 // scheduleSnd() is non-blocking: it hands a request to the queue and returns.
 // audioTask() routes by sound:
-//   - phaser/torpedo → playPcm() — pre-decoded int16 PCM, sequential
+//   - phaser/torpedo → playMixedVoices() — pre-decoded int16 PCM, greedy mixer
+//                      pulls every queued clip that overlaps the running window
 //   - anthem         → AudioGeneratorMP3 streamed directly to i2sOut
 struct SoundReq { const uint8_t* data; size_t len; uint32_t schedMs; };
 #define SOUND_QUEUE_SIZE 20
@@ -130,39 +131,26 @@ void scheduleSnd(const uint8_t* data, size_t len, uint32_t delayMs) {
     xQueueSend(soundQueue, &r, 0);
 }
 
-static void playPcm(const int16_t* data, int len) {
+// Plays up to N PCM voices mixed together, each starting at its own sample offset.
+// Samples are summed and clamped; clip peaks are low (~6000 of 32767) so 3-4 voices
+// stay well within int16 range even when fully overlapping.
+struct Voice { const int16_t* data; int len; int offsetSamples; };
+static void playMixedVoices(const Voice* voices, int numVoices) {
     i2sOut->begin();
     i2sOut->SetRate(44100);
     i2sOut->SetGain(speakerVol * I2S_MAX_GAIN);
-    int k = 0;
-    while (k < len) {
-        int16_t s = (int16_t)pgm_read_word(&data[k]);
-        int16_t out[2] = {s, s};
-        if (i2sOut->ConsumeSample(out)) {
-            k++;
-        } else {
-            vTaskDelay(1);
-        }
+    int total = 0;
+    for (int v = 0; v < numVoices; v++) {
+        int endK = voices[v].offsetSamples + voices[v].len;
+        if (endK > total) total = endK;
     }
-    vTaskDelay(20);
-    i2sOut->stop();
-}
-
-// Plays two PCM streams mixed, with data2 starting at offsetSamples into data1.
-// Samples are summed and clamped; both clips have low peaks so clipping is unlikely.
-static void playPcmMixed(const int16_t* data1, int len1,
-                         const int16_t* data2, int len2,
-                         int offsetSamples) {
-    i2sOut->begin();
-    i2sOut->SetRate(44100);
-    i2sOut->SetGain(speakerVol * I2S_MAX_GAIN);
-    int total = max(len1, offsetSamples + len2);
     for (int k = 0; k < total; k++) {
         int32_t s = 0;
-        if (k < len1)
-            s += (int16_t)pgm_read_word(&data1[k]);
-        if (k >= offsetSamples && (k - offsetSamples) < len2)
-            s += (int16_t)pgm_read_word(&data2[k - offsetSamples]);
+        for (int v = 0; v < numVoices; v++) {
+            int idx = k - voices[v].offsetSamples;
+            if (idx >= 0 && idx < voices[v].len)
+                s += (int16_t)pgm_read_word(&voices[v].data[idx]);
+        }
         if (s >  32767) s =  32767;
         if (s < -32768) s = -32768;
         int16_t out[2] = {(int16_t)s, (int16_t)s};
@@ -204,27 +192,37 @@ void audioTask(void*) {
             for (int k = 0; k < 4096; k++) i2sOut->ConsumeSample(silence);
             i2sOut->SetRate(44100);
         } else if (req.len == PHASER_MP3_LEN || req.len == TORPEDO_MP3_LEN) {
-            const int16_t* pcm1    = (req.len == PHASER_MP3_LEN) ? PHASER_PCM    : TORPEDO_PCM;
-            int            pcmLen1 = (req.len == PHASER_MP3_LEN) ? PHASER_PCM_LEN : TORPEDO_PCM_LEN;
-            uint32_t       startMs = millis();
-            uint32_t       endMs   = startMs + (uint32_t)pcmLen1 * 1000UL / 44100UL;
+            // Greedily collect all queued PCM clips that overlap with the running
+            // playback window, then render them in a single mixed pass so that
+            // 3-way overlaps (e.g. Fire Everything t1+t2+p2) play correctly.
+            constexpr int MAX_VOICES = 4;
+            Voice voices[MAX_VOICES];
+            int numVoices = 0;
+            uint32_t startMs = millis();
+            auto pcmDataFor = [](size_t l) -> const int16_t* {
+                return (l == PHASER_MP3_LEN) ? PHASER_PCM : TORPEDO_PCM;
+            };
+            auto pcmLenFor = [](size_t l) -> int {
+                return (l == PHASER_MP3_LEN) ? PHASER_PCM_LEN : TORPEDO_PCM_LEN;
+            };
+            voices[numVoices++] = { pcmDataFor(req.len), pcmLenFor(req.len), 0 };
+            int endSample = voices[0].len;
 
-            // Peek at the next queued sound. If it's a PCM clip scheduled to start
-            // before this one finishes, pull it out and mix both in one pass.
-            SoundReq nxt;
-            if (xQueuePeek(soundQueue, &nxt, 0) == pdTRUE &&
-                nxt.len != ANTHEM_MP3_LEN &&
-                (int32_t)(nxt.schedMs - endMs) < 0) {
-                xQueueReceive(soundQueue, &nxt, 0);
-                const int16_t* pcm2    = (nxt.len == PHASER_MP3_LEN) ? PHASER_PCM    : TORPEDO_PCM;
-                int            pcmLen2 = (nxt.len == PHASER_MP3_LEN) ? PHASER_PCM_LEN : TORPEDO_PCM_LEN;
-                int32_t        offsetMs = (int32_t)(nxt.schedMs - startMs);
+            while (numVoices < MAX_VOICES) {
+                SoundReq nxt;
+                if (xQueuePeek(soundQueue, &nxt, 0) != pdTRUE) break;
+                if (nxt.len == ANTHEM_MP3_LEN) break;
+                int32_t offsetMs = (int32_t)(nxt.schedMs - startMs);
                 if (offsetMs < 0) offsetMs = 0;
                 int offsetSamples = (int)(offsetMs * 44100L / 1000L);
-                playPcmMixed(pcm1, pcmLen1, pcm2, pcmLen2, offsetSamples);
-            } else {
-                playPcm(pcm1, pcmLen1);
+                if (offsetSamples >= endSample) break;   // no overlap with any active voice
+                xQueueReceive(soundQueue, &nxt, 0);
+                int len2 = pcmLenFor(nxt.len);
+                voices[numVoices++] = { pcmDataFor(nxt.len), len2, offsetSamples };
+                int newEnd = offsetSamples + len2;
+                if (newEnd > endSample) endSample = newEnd;
             }
+            playMixedVoices(voices, numVoices);
         }
     }
 }
