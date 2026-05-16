@@ -89,6 +89,7 @@
 #include <AudioFileSourcePROGMEM.h>
 #include <AudioGeneratorMP3.h>
 #include <AudioOutputI2S.h>
+#include "driver/i2s.h"
 #include "anthem_mp3.h"    // Anthem startup music — streamed via MP3 decoder (too big to pre-decode)
 #include "torpedo_mp3.h"   // kept so action funcs can pass TORPEDO_MP3 as a routing token
 #include "phaser_mp3.h"    // kept so action funcs can pass PHASER_MP3 as a routing token
@@ -131,39 +132,31 @@ void scheduleSnd(const uint8_t* data, size_t len, uint32_t delayMs) {
 }
 
 static void playPcm(const int16_t* data, int len) {
-    // Mirror what mp3.begin() does for anthem: call begin() just before
-    // writing samples. On this ESP8266Audio build begin() may need to be
-    // called to prime the DMA before ConsumeSample will produce output.
-    i2sOut->begin();
+    // SetRate on a running driver calls i2s_set_clk — fast path, no reinstall.
     i2sOut->SetRate(44100);
     i2sOut->SetGain(speakerVol * I2S_MAX_GAIN);
-    int16_t silence[2] = {0, 0};
     int k = 0;
     while (k < len) {
         int16_t s = (int16_t)pgm_read_word(&data[k]);
         int16_t out[2] = {s, s};
-        // ConsumeSample returns false if the DMA buffer can't accept the sample
-        // right now; do NOT advance — yield and retry, matching how
-        // AudioGeneratorMP3::loop() handles backpressure.
         if (i2sOut->ConsumeSample(out)) {
             k++;
         } else {
             vTaskDelay(1);
         }
     }
-    // Flush silence without a retry loop: this build's ConsumeSample returns
-    // false for zero-value samples, so the while(!...) vTaskDelay(1) pattern
-    // would spin for 4096 ms. Match the anthem path — call directly, ignore
-    // the return value.
-    for (int k = 0; k < 4096; k++) i2sOut->ConsumeSample(silence);
+    // Let the last DMA buffer drain, then zero the hardware buffers directly.
+    // ConsumeSample rejects {0,0} on this build so silence flush via it is a no-op.
+    vTaskDelay(10);
+    i2s_zero_dma_buffer((i2s_port_t)0);
 }
 
 void audioTask(void*) {
     i2sOut = new AudioOutputI2S();
     i2sOut->SetPinout(I2S_BCLK, I2S_LRC, I2S_DIN);
-    i2sOut->SetRate(44100);
+    i2sOut->begin();            // install I2S driver first
+    i2sOut->SetRate(44100);     // SetRate after begin() calls i2s_set_clk on the running driver
     i2sOut->SetGain(speakerVol * I2S_MAX_GAIN);
-    i2sOut->begin();
 
     int16_t silence[2] = {0, 0};
     SoundReq req;
