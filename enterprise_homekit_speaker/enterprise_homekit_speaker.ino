@@ -107,7 +107,7 @@ static constexpr int I2S_DIN  = 8;
 // AUDIO_SPEAKER: sounds play through the I2S amp/speaker in the base
 #define AUDIO_BROWSER 0
 #define AUDIO_SPEAKER 1
-volatile int   audioMode  = AUDIO_BROWSER;
+volatile int   audioMode  = AUDIO_SPEAKER;
 volatile float speakerVol = 0.25f;   // 0.0–1.0; start quiet so first power-on doesn't blast
 // MAX98357A is already at its 9 dB hardware gain. Anything above ~0.5 of full
 // software scale clips noticeably; keep this conservative.
@@ -314,7 +314,7 @@ void loadTimings() {
     T.anthem_wait     = prefs.getInt("anthem_wait",     T.anthem_wait);
     T.anthem_gap      = prefs.getInt("anthem_gap",      T.anthem_gap);
     T.anthem_last_gap = prefs.getInt("anthem_last_gap", T.anthem_last_gap);
-    audioMode         = prefs.getInt  ("audio_mode",   AUDIO_BROWSER);
+    audioMode         = prefs.getInt  ("audio_mode",   AUDIO_SPEAKER);
     speakerVol        = prefs.getFloat("speaker_vol",  0.25f);
     prefs.end();
     Serial.println("Settings loaded from NVS");
